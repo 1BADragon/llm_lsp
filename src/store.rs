@@ -13,6 +13,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use crate::lang::Lang;
+use crate::notes::{self, Note, NoteScope};
 
 #[derive(Clone)]
 pub struct Store {
@@ -176,6 +177,143 @@ impl Store {
         Ok(n)
     }
 
+    /// Adds a note, or refreshes an identical one (same place, same
+    /// normalized text). `path`/`symbol` are ignored where the scope doesn't
+    /// use them.
+    pub async fn add_note(
+        &self,
+        scope: NoteScope,
+        path: &str,
+        symbol: &str,
+        text: &str,
+        source: &str,
+    ) -> Result<()> {
+        let path = if scope == NoteScope::Project { "" } else { path };
+        let symbol = if scope == NoteScope::Symbol { symbol } else { "" };
+        let now = unix(SystemTime::now());
+        sqlx::query(
+            "INSERT INTO notes (scope, path, symbol, text, norm, source, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (scope, path, symbol, norm) DO UPDATE SET updated_at = excluded.updated_at",
+        )
+        .bind(scope.as_str())
+        .bind(path)
+        .bind(symbol)
+        .bind(text)
+        .bind(notes::normalize(text))
+        .bind(source)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Notes relevant to `symbol` in `path`: its own, its file's, and the
+    /// most recent project-wide ones.
+    pub async fn notes_for(&self, path: &str, symbol: &str) -> Result<Vec<Note>> {
+        let rows = sqlx::query(
+            "SELECT * FROM (
+                 SELECT id, scope, path, symbol, text FROM notes WHERE scope = 'project'
+                 ORDER BY updated_at DESC, id DESC LIMIT ?
+             )
+             UNION ALL
+             SELECT id, scope, path, symbol, text FROM notes
+             WHERE (scope = 'file' AND path = ?) OR (scope = 'symbol' AND path = ? AND symbol = ?)",
+        )
+        .bind(notes::MAX_PROJECT_IN_PROMPT as i64)
+        .bind(path)
+        .bind(path)
+        .bind(symbol)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: Vec<Note> = rows.iter().filter_map(note_from_row).collect();
+        out.sort_by_key(|n| (n.scope, n.id));
+        Ok(out)
+    }
+
+    pub async fn all_notes(&self) -> Result<Vec<Note>> {
+        let rows = sqlx::query("SELECT id, scope, path, symbol, text FROM notes ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().filter_map(note_from_row).collect())
+    }
+
+    /// Symbol-scoped notes in one file, as `(id, qualified name)`.
+    pub async fn symbol_notes_in(&self, path: &str) -> Result<Vec<(i64, String)>> {
+        Ok(
+            sqlx::query_as("SELECT id, symbol FROM notes WHERE scope = 'symbol' AND path = ?")
+                .bind(path)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Every distinct file path that file or symbol notes refer to.
+    pub async fn note_paths(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT DISTINCT path FROM notes WHERE path != ''")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(p,)| p).collect())
+    }
+
+    pub async fn update_note_text(&self, id: i64, text: &str) -> Result<()> {
+        sqlx::query("UPDATE notes SET text = ?, norm = ?, updated_at = ? WHERE id = ?")
+            .bind(text)
+            .bind(notes::normalize(text))
+            .bind(unix(SystemTime::now()))
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_notes(&self, ids: &[i64]) -> Result<u64> {
+        let mut n = 0;
+        for id in ids {
+            n += sqlx::query("DELETE FROM notes WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        }
+        Ok(n)
+    }
+
+    pub async fn delete_notes_for_path(&self, path: &str) -> Result<u64> {
+        Ok(sqlx::query("DELETE FROM notes WHERE path = ?")
+            .bind(path)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
+    pub async fn clear_notes(&self) -> Result<u64> {
+        Ok(sqlx::query("DELETE FROM notes").execute(&self.pool).await?.rows_affected())
+    }
+
+    /// Keeps the most recently confirmed notes per place: 50 project-wide,
+    /// 10 per file, 5 per symbol.
+    pub async fn prune_notes(&self) -> Result<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM notes WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, scope, ROW_NUMBER() OVER (
+                         PARTITION BY scope, path, symbol ORDER BY updated_at DESC, id DESC
+                     ) AS rank
+                     FROM notes
+                 )
+                 WHERE (scope = 'project' AND rank > 50)
+                    OR (scope = 'file' AND rank > 10)
+                    OR (scope = 'symbol' AND rank > 5)
+             )",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
     pub async fn record_run(&self, run: NewRun<'_>) -> Result<()> {
         sqlx::query(
             "INSERT INTO runs
@@ -194,6 +332,16 @@ impl Store {
         .await?;
         Ok(())
     }
+}
+
+fn note_from_row(row: &sqlx::sqlite::SqliteRow) -> Option<Note> {
+    Some(Note {
+        id: row.get("id"),
+        scope: NoteScope::parse(row.get("scope"))?,
+        path: row.get("path"),
+        symbol: row.get("symbol"),
+        text: row.get("text"),
+    })
 }
 
 /// `$XDG_DATA_HOME/llm_lsp/<16 hex chars of blake3(root)>.db`.
@@ -286,6 +434,65 @@ mod tests {
         let hour_ago = now - Duration::from_secs(3600);
         assert_eq!(store.runs_since("review", hour_ago).await.unwrap(), 1);
         assert_eq!(store.runs_since("doc", hour_ago).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn notes_dedupe_and_scope_their_place() {
+        let store = Store::open_in_memory().await.unwrap();
+        use NoteScope::*;
+        store.add_note(Project, "src/a.rs", "f", "Uses anyhow.", "f").await.unwrap();
+        store.add_note(Project, "src/b.rs", "g", "uses  ANYHOW", "g").await.unwrap(); // duplicate
+        store.add_note(File, "src/a.rs", "f", "byte offsets", "f").await.unwrap();
+        store.add_note(Symbol, "src/a.rs", "f", "never 0", "f").await.unwrap();
+        store.add_note(Symbol, "src/a.rs", "g", "other symbol", "g").await.unwrap();
+        store.add_note(File, "src/b.rs", "", "other file", "x").await.unwrap();
+
+        let all = store.all_notes().await.unwrap();
+        assert_eq!(all.len(), 5);
+        assert_eq!((all[0].path.as_str(), all[0].symbol.as_str()), ("", ""), "project notes drop their place");
+
+        let texts = |ns: Vec<Note>| ns.into_iter().map(|n| n.text).collect::<Vec<_>>();
+        assert_eq!(
+            texts(store.notes_for("src/a.rs", "f").await.unwrap()),
+            ["Uses anyhow.", "byte offsets", "never 0"]
+        );
+        assert_eq!(texts(store.notes_for("src/b.rs", "f").await.unwrap()), ["Uses anyhow.", "other file"]);
+    }
+
+    #[tokio::test]
+    async fn notes_edit_delete_clear_and_paths() {
+        let store = Store::open_in_memory().await.unwrap();
+        use NoteScope::*;
+        store.add_note(Symbol, "src/a.rs", "f", "one", "f").await.unwrap();
+        store.add_note(Symbol, "src/a.rs", "g", "two", "g").await.unwrap();
+        store.add_note(File, "src/b.rs", "", "three", "x").await.unwrap();
+        let ids: Vec<i64> = store.all_notes().await.unwrap().iter().map(|n| n.id).collect();
+
+        store.update_note_text(ids[0], "uno").await.unwrap();
+        assert_eq!(store.all_notes().await.unwrap()[0].text, "uno");
+        let mut syms = store.symbol_notes_in("src/a.rs").await.unwrap();
+        syms.sort();
+        assert_eq!(syms, [(ids[0], "f".into()), (ids[1], "g".into())]);
+        let mut paths = store.note_paths().await.unwrap();
+        paths.sort();
+        assert_eq!(paths, ["src/a.rs", "src/b.rs"]);
+
+        assert_eq!(store.delete_notes(&[ids[1], 999]).await.unwrap(), 1);
+        assert_eq!(store.delete_notes_for_path("src/b.rs").await.unwrap(), 1);
+        assert_eq!(store.clear_notes().await.unwrap(), 1);
+        assert!(store.all_notes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_the_newest_per_place() {
+        let store = Store::open_in_memory().await.unwrap();
+        for i in 0..7 {
+            store.add_note(NoteScope::Symbol, "a.rs", "f", &format!("n{i}"), "f").await.unwrap();
+        }
+        store.add_note(NoteScope::Symbol, "a.rs", "g", "g0", "g").await.unwrap();
+        assert_eq!(store.prune_notes().await.unwrap(), 2);
+        let left: Vec<_> = store.all_notes().await.unwrap().into_iter().map(|n| n.text).collect();
+        assert_eq!(left, ["n2", "n3", "n4", "n5", "n6", "g0"]);
     }
 
     #[tokio::test]

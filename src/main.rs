@@ -5,6 +5,7 @@ mod claude;
 mod docs;
 mod document;
 mod lang;
+mod notes;
 mod review;
 mod server;
 mod store;

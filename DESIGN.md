@@ -197,12 +197,28 @@ Modules and macros are out.
 
 ### Notes
 
-- The model may return `notes` with any response, e.g. "error handling in
-  this crate uses `anyhow` at the boundary, `thiserror` inside". The server
-  decides what to store: deduplicated, scoped to project / path / symbol, and
-  capped in number.
-- Relevant notes go into later prompts. Notes on deleted symbols are pruned.
-  `llm.showNotes` / `llm.clearNotes` commands let me check what it believes.
+- Reviews may return `notes` (scope `project` / `file` / `symbol` plus one
+  sentence of text), e.g. "error handling in this crate uses `anyhow` at the
+  boundary, `thiserror` inside". The prompt asks only for durable,
+  non-obvious facts useful for reviewing *other* code later, and says
+  usually there are none. The server attaches the file path and symbol from
+  the review itself, so the model can't invent locations.
+- Existing notes are shown with ids, and a review can retire wrong or stale
+  ones via `obsolete_notes`. Only ids it was shown are accepted. Tested: a
+  seeded false note was retired.
+- Stored deduplicated by normalized text per place, with at most 3 new notes
+  per review. Kept per place, newest first: 50 project-wide, 10 per file,
+  5 per symbol. Ids are never reused.
+- Relevant notes go into review *and* doc prompts: the 30 most recent
+  project notes, plus the file's and the symbol's. Docs can't add notes.
+- Pruned automatically: notes on symbols that no longer exist (checked
+  before each review of that file), and on files that no longer exist
+  (checked at startup).
+- `llm.showNotes` writes all notes to `<db>.notes.md` and opens it in the
+  editor. Deleting a line or editing its text, then saving, updates the notes
+  (the server checks the file once a second). Only notes that were in the
+  file can be deleted that way. `llm.clearNotes` deletes all notes after a
+  confirmation prompt.
 
 ## Project context
 
@@ -240,7 +256,7 @@ Database file at `$XDG_DATA_HOME/llm_lsp/<project-hash>.db`.
 | `docs` | `(lang, body_hash)` | Cached hover docs |
 | `reviews` | `(lang, body_hash)` | Last review result for exactly this body |
 | `dismissals` | `(qualified_name, fingerprint)` | Findings I rejected |
-| `notes` | id, scope | Model's project notes |
+| `notes` | id; unique (scope, path, symbol, normalized text) | Model's project notes |
 | `runs` | id | Model, duration, cost/tokens, outcome |
 
 Because everything is keyed by content hash, an unchanged function is never
@@ -286,7 +302,7 @@ Commands can be bound to keys with `:lsp-workspace-command`, e.g.
 3. ~~Hover docs + SQLite cache + `claude -p` runner~~: done.
 4. Activity tracker, leave-event trigger, scheduler.
 5. ~~Passive review → diagnostics → code actions → dismissals~~: done.
-6. Notes.
+6. ~~Notes~~: done.
 7. Extra languages.
 
 ## Decision log

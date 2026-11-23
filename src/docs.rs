@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::lang::Lang;
+use crate::notes::{self, Note};
 use crate::symbols::Symbol;
 
 /// Bump whenever `SYSTEM_PROMPT` or `prompt` changes meaningfully, so cached
@@ -42,6 +43,8 @@ pub struct DocRequest<'a> {
     pub file_text: &'a str,
     /// `(file name, contents)` of project context files.
     pub context: &'a [(String, String)],
+    /// Notes from earlier reviews (read-only here).
+    pub notes: &'a [Note],
 }
 
 /// Cache key for a symbol's text. Whitespace runs are collapsed first, so
@@ -59,6 +62,7 @@ pub fn prompt(req: &DocRequest) -> String {
     let sym = req.symbol;
     let lang = req.lang.name();
     let mut out = context_section(req.context);
+    out.push_str(&notes::prompt_section(req.notes));
     out.push_str(&file_section(req.path, req.lang, req.file_text, sym));
     out.push_str(&format!(
         "Document this {lang} {kind}: `{name}` (lines {start}-{end} of the file):\n<symbol>\n{body}\n</symbol>\n",
@@ -182,6 +186,7 @@ mod tests {
             path: Path::new("src/math.rs"),
             file_text: file,
             context: &context,
+            notes: &[],
         });
         assert!(p.contains("<context file=\"CLAUDE.md\">\nUse i32 everywhere."));
         assert!(p.contains("File: src/math.rs (rust)\n<file>\nuse x;"));

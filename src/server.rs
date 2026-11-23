@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use anyhow::Context as _;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Semaphore;
@@ -21,6 +22,7 @@ use crate::claude;
 use crate::docs::{self, DocRequest};
 use crate::document::{Document, Encoding};
 use crate::lang::Lang;
+use crate::notes;
 use crate::review::{self, Finding, ReviewRequest};
 use crate::store::{CacheKey, NewDoc, NewRun, Store};
 use crate::symbols::{self, Symbol};
@@ -34,6 +36,10 @@ const DISMISS_COMMAND: &str = "llm.dismiss";
 /// Review a function now. Arguments: `[uri, qualified_name]`, or none for
 /// the function in focus (what `:lsp-workspace-command` sends).
 const REVIEW_COMMAND: &str = "llm.reviewSymbol";
+/// Open the notes as an editable Markdown file.
+const SHOW_NOTES_COMMAND: &str = "llm.showNotes";
+/// Delete every note for the project (asks first).
+const CLEAR_NOTES_COMMAND: &str = "llm.clearNotes";
 const SOURCE: &str = "llm_lsp";
 
 /// Settings from the editor's `initializationOptions`. In Helix:
@@ -97,6 +103,16 @@ enum ReviewOutcome {
     Skipped(String),
 }
 
+/// The notes file last written by `llm.showNotes`, so edits to it can be
+/// read back.
+struct NotesView {
+    path: PathBuf,
+    /// Modification time right after we wrote it.
+    written: SystemTime,
+    /// Ids the file showed. Only these can be deleted by editing it.
+    ids: HashSet<i64>,
+}
+
 /// A finding that still applies to the current text, ready to show.
 struct LiveFinding {
     diagnostic: Diagnostic,
@@ -119,6 +135,7 @@ pub struct State {
     pending: Mutex<HashMap<CacheKey, Pending>>,
     doc_slots: Semaphore,
     next_token: AtomicU64,
+    notes_view: Mutex<Option<NotesView>>,
     review_queue: Mutex<VecDeque<SymbolId>>,
     reviewing: AtomicBool,
     /// Findings by document URI (as a string, like `SymbolId::uri`).
@@ -166,6 +183,7 @@ impl Backend {
             reviewing: AtomicBool::new(false),
             findings: Mutex::new(HashMap::new()),
             dismissed: Mutex::new(HashSet::new()),
+            notes_view: Mutex::new(None),
         }))
     }
 }
@@ -248,6 +266,9 @@ impl State {
     }
 
     async fn tick(self: &Arc<Self>) {
+        if let Err(e) = self.sync_notes_view().await {
+            warn!("reading edited notes: {e:#}");
+        }
         let now = Instant::now();
         let (left, idle) = {
             let mut tracker = self.tracker.lock().unwrap();
@@ -333,6 +354,9 @@ impl State {
                     return Ok(ReviewOutcome::Skipped(msg));
                 }
 
+                let path = target.path.to_string_lossy();
+                self.prune_symbol_notes(&uri, &path).await?;
+                let shown_notes = store.notes_for(&path, name).await?;
                 let context = read_context_files(&self.root());
                 let prompt = review::prompt(&ReviewRequest {
                     lang: target.key.lang,
@@ -340,6 +364,7 @@ impl State {
                     path: &target.path,
                     file_text: &target.file_text,
                     context: &context,
+                    notes: &shown_notes,
                 });
                 let run = claude::Run {
                     program: config.claude.clone(),
@@ -358,11 +383,24 @@ impl State {
                 }
                 let output = result?;
                 let structured = output.structured.expect("checked by claude::Run");
-                let findings = review::parse(structured, target.body())?;
+                let parsed = review::parse(structured, target.body(), &shown_notes)?;
                 store
-                    .put_review(&target.key, name, &serde_json::to_string(&findings)?, &config.review_model)
+                    .put_review(&target.key, name, &serde_json::to_string(&parsed.findings)?, &config.review_model)
                     .await?;
-                findings
+                for note in &parsed.notes {
+                    store.add_note(note.scope, &path, name, &note.text, name).await?;
+                }
+                store.delete_notes(&parsed.obsolete_notes).await?;
+                store.prune_notes().await?;
+                if !parsed.notes.is_empty() || !parsed.obsolete_notes.is_empty() {
+                    info!(
+                        name = %name,
+                        added = ?parsed.notes.iter().map(|n| &n.text).collect::<Vec<_>>(),
+                        retired = ?parsed.obsolete_notes,
+                        "notes"
+                    );
+                }
+                parsed.findings
             }
         };
         info!(name = %name, findings = findings.len(), "reviewed");
@@ -555,6 +593,10 @@ impl State {
 
     async fn run_doc(&self, target: &Target) -> anyhow::Result<()> {
         let config = self.config();
+        let store = self.store().expect("only called with a store");
+        let notes = store
+            .notes_for(&target.path.to_string_lossy(), &target.symbol.qualified_name)
+            .await?;
         let context = read_context_files(&self.root());
         let prompt = docs::prompt(&DocRequest {
             lang: target.key.lang,
@@ -562,6 +604,7 @@ impl State {
             path: &target.path,
             file_text: &target.file_text,
             context: &context,
+            notes: &notes,
         });
         let run = claude::Run {
             program: config.claude.clone(),
@@ -576,8 +619,7 @@ impl State {
         let output = self.run_claude("doc", &target.symbol.qualified_name, &run).await?;
         let doc = docs::clean(&output.text);
         anyhow::ensure!(!doc.is_empty(), "the model returned an empty doc");
-        self.store()
-            .expect("only called with a store")
+        store
             .put_doc(NewDoc {
                 key: &target.key,
                 qualified_name: &target.symbol.qualified_name,
@@ -636,6 +678,158 @@ impl State {
         )
     }
 
+    /// Deletes notes about symbols that no longer exist in this (open) file.
+    async fn prune_symbol_notes(&self, uri: &Uri, path: &str) -> anyhow::Result<()> {
+        let Some(store) = self.store() else {
+            return Ok(());
+        };
+        let candidates = store.symbol_notes_in(path).await?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let gone: Vec<i64> = {
+            let docs = self.docs.lock().unwrap();
+            let Some(doc) = docs.get(uri) else {
+                return Ok(());
+            };
+            let (Some(lang), Some(tree)) = (doc.lang, doc.tree()) else {
+                return Ok(());
+            };
+            candidates
+                .into_iter()
+                .filter(|(_, name)| symbols::find_reviewable(lang, tree, doc.text(), name).is_none())
+                .map(|(id, _)| id)
+                .collect()
+        };
+        if !gone.is_empty() {
+            info!(?gone, path, "deleting notes about symbols that no longer exist");
+            store.delete_notes(&gone).await?;
+        }
+        Ok(())
+    }
+
+    fn notes_view_path(&self) -> PathBuf {
+        crate::store::default_path(&self.root()).with_extension("notes.md")
+    }
+
+    /// `llm.showNotes`: writes all notes to a Markdown file and opens it.
+    async fn show_notes(&self) -> anyhow::Result<()> {
+        let store = self.store().context("the database failed to open")?;
+        let all = store.all_notes().await?;
+        let path = self.notes_view_path();
+        std::fs::write(&path, notes::render(&self.root().display().to_string(), &all))?;
+        let written = std::fs::metadata(&path)?.modified()?;
+        *self.notes_view.lock().unwrap() = Some(NotesView {
+            path: path.clone(),
+            written,
+            ids: all.iter().map(|n| n.id).collect(),
+        });
+        let uri = Uri::from_file_path(&path).context("notes path isn't a valid URI")?;
+        let shown = self
+            .client
+            .show_document(ShowDocumentParams {
+                uri,
+                external: Some(false),
+                take_focus: Some(true),
+                selection: None,
+            })
+            .await
+            .unwrap_or(false);
+        if !shown {
+            self.client
+                .show_message(MessageType::INFO, format!("llm_lsp: notes are in {}", path.display()))
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Applies edits I saved to the notes file: removed lines delete their
+    /// notes, edited text updates them.
+    async fn sync_notes_view(&self) -> anyhow::Result<()> {
+        let Some(store) = self.store() else {
+            return Ok(());
+        };
+        let (path, written, ids) = match &*self.notes_view.lock().unwrap() {
+            Some(v) => (v.path.clone(), v.written, v.ids.clone()),
+            None => return Ok(()),
+        };
+        let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            return Ok(());
+        };
+        if modified <= written {
+            return Ok(());
+        }
+
+        let kept: HashMap<i64, String> = notes::parse_view(&std::fs::read_to_string(&path)?)
+            .into_iter()
+            .collect();
+        let current: HashMap<i64, String> =
+            store.all_notes().await?.into_iter().map(|n| (n.id, n.text)).collect();
+        let deleted: Vec<i64> = ids
+            .iter()
+            .copied()
+            .filter(|id| !kept.contains_key(id) && current.contains_key(id))
+            .collect();
+        let mut edited = 0;
+        for (id, text) in &kept {
+            if ids.contains(id) && current.get(id).is_some_and(|old| old != text) {
+                store.update_note_text(*id, text).await?;
+                edited += 1;
+            }
+        }
+        store.delete_notes(&deleted).await?;
+
+        if let Some(v) = &mut *self.notes_view.lock().unwrap() {
+            v.written = modified;
+            v.ids.retain(|id| !deleted.contains(id));
+        }
+        if !deleted.is_empty() || edited > 0 {
+            let msg = format!("llm_lsp: notes updated ({} deleted, {edited} edited)", deleted.len());
+            info!("{msg}");
+            self.client.show_message(MessageType::INFO, msg).await;
+        }
+        Ok(())
+    }
+
+    /// `llm.clearNotes`: deletes every note, after asking.
+    async fn clear_notes(&self) -> anyhow::Result<()> {
+        let store = self.store().context("the database failed to open")?;
+        let count = store.all_notes().await?.len();
+        if count == 0 {
+            self.client.show_message(MessageType::INFO, "llm_lsp: there are no notes").await;
+            return Ok(());
+        }
+        let delete = MessageActionItem {
+            title: format!("Delete {}", plural(count, "note")),
+            properties: HashMap::new(),
+        };
+        let choice = self
+            .client
+            .show_message_request(
+                MessageType::WARNING,
+                format!("llm_lsp: delete {} for this project?", match count {
+                    1 => "the only note".to_string(),
+                    n => format!("all {n} notes"),
+                }),
+                Some(vec![
+                    delete.clone(),
+                    MessageActionItem {
+                        title: "Cancel".into(),
+                        properties: HashMap::new(),
+                    },
+                ]),
+            )
+            .await?;
+        if choice.is_some_and(|c| c.title == delete.title) {
+            let n = store.clear_notes().await?;
+            *self.notes_view.lock().unwrap() = None;
+            self.client
+                .show_message(MessageType::INFO, format!("llm_lsp: deleted {}", plural(n as usize, "note")))
+                .await;
+        }
+        Ok(())
+    }
+
     async fn dismiss(&self, uri: &str, qualified_name: &str, fingerprint: &str) -> anyhow::Result<()> {
         self.dismissed
             .lock()
@@ -647,6 +841,17 @@ impl State {
         self.publish(&uri.parse()?).await;
         Ok(())
     }
+}
+
+/// Deletes notes about files that no longer exist.
+async fn prune_missing_files(store: &Store, root: &Path) -> anyhow::Result<()> {
+    for path in store.note_paths().await? {
+        if !root.join(&path).exists() {
+            let n = store.delete_notes_for_path(&path).await?;
+            info!(path, n, "deleted notes about a file that no longer exists");
+        }
+    }
+    Ok(())
 }
 
 fn read_context_files(root: &Path) -> Vec<(String, String)> {
@@ -683,11 +888,15 @@ fn project_root(params: &InitializeParams) -> Option<PathBuf> {
     uri.to_file_path().map(|p| p.into_owned())
 }
 
+/// `1 note`, `3 notes`.
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
+}
+
 fn review_summary(name: &str, shown: usize, total: usize, cached: bool) -> String {
     let what = match shown {
         0 => "no findings".to_string(),
-        1 => "1 finding".to_string(),
-        n => format!("{n} findings"),
+        n => plural(n, "finding"),
     };
     let mut notes = Vec::new();
     if total > shown {
@@ -772,6 +981,9 @@ impl LanguageServer for Backend {
                 Ok(d) => self.dismissed.lock().unwrap().extend(d),
                 Err(e) => error!("loading dismissals: {e:#}"),
             }
+            if let Err(e) = prune_missing_files(store, &root).await {
+                error!("pruning notes: {e:#}");
+            }
         }
         let _ = self.store.set(store);
         info!(?enc, root = %root.display(), db = %db.display(), config = ?self.config(), "initialize");
@@ -794,7 +1006,9 @@ impl LanguageServer for Backend {
                 completion_provider: Some(CompletionOptions::default()),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec![DISMISS_COMMAND.into(), REVIEW_COMMAND.into()],
+                    commands: [DISMISS_COMMAND, REVIEW_COMMAND, SHOW_NOTES_COMMAND, CLEAR_NOTES_COMMAND]
+                        .map(String::from)
+                        .into(),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -963,7 +1177,18 @@ impl LanguageServer for Backend {
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<LSPAny>> {
-        if params.command == REVIEW_COMMAND {
+        if params.command == SHOW_NOTES_COMMAND || params.command == CLEAR_NOTES_COMMAND {
+            let result = if params.command == SHOW_NOTES_COMMAND {
+                self.show_notes().await
+            } else {
+                self.clear_notes().await
+            };
+            if let Err(e) = result {
+                self.client
+                    .show_message(MessageType::ERROR, format!("llm_lsp: {}: {e:#}", params.command))
+                    .await;
+            }
+        } else if params.command == REVIEW_COMMAND {
             let id = match review_target(&params.arguments) {
                 Some(Some(id)) => Some(id),
                 Some(None) => self.tracker.lock().unwrap().focus().cloned(),
