@@ -1,13 +1,16 @@
 //! llm_lsp: an LLM-backed pair-programmer language server. See DESIGN.md.
 
-// The `symbols` and `activity` stubs leave much of the plumbing unused.
+// The `activity` stub leaves some of the plumbing unused.
 // Remove once they're implemented.
 #![allow(dead_code)]
 
 mod activity;
+mod claude;
+mod docs;
 mod document;
 mod lang;
 mod server;
+mod store;
 mod symbols;
 
 use tower_lsp_server::{LspService, Server};

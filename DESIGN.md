@@ -83,8 +83,11 @@ It uses an LLM to:
 - **Workspace**. Keeps the open documents' text plus one tree-sitter tree per
   document, re-parsed incrementally on every change.
 - **Code structure**. Maps a position to its enclosing *symbol* (function,
-  method, impl/class) using each grammar's tags query (`@definition.*`
-  captures). Produces a `SymbolKey { lang, path, qualified_name, body_hash }`.
+  method, impl/class) by walking up the syntax tree from the cursor and
+  matching node kinds from a small per-language table. (The grammars' bundled
+  tags queries were tried and dropped: their quirks needed as much special
+  casing as the table.) Produces a
+  `SymbolKey { lang, path, qualified_name, body_hash }`.
   Fallback for languages without a grammar: a line window around the edit.
 - **Activity tracker**. Infers where I'm working (see below).
 - **Scheduler**. Decides when to run a review, and enforces the debounce, the
@@ -186,9 +189,14 @@ The model is told it is a *reviewer*. It is not writing the code.
 
 ## LLM runner
 
-- `claude -p` with `cwd` = workspace root, `--output-format json`, a fixed
-  system prompt, and read-only tools only (Read, Grep, Glob). No Edit, Write,
-  or Bash.
+- `claude -p` with `cwd` = workspace root, `--output-format json`, our own
+  short `--system-prompt` (replacing Claude Code's large default, which is
+  faster and cheaper), and read-only tools only (Read, Grep, Glob). No Edit,
+  Write, or Bash. Isolated from the user's Claude Code setup: no settings
+  sources, MCP servers, slash commands or auto-memory. So `CLAUDE.md` /
+  `AGENTS.md` are read by us and put in the prompt. The prompt goes on stdin.
+- Measured (Claude Code 2.1, Haiku): CLI startup ≈1.4s; a hover doc ≈2.7s
+  end to end at ≈$0.001.
 - Per-task model: review → sonnet, hover docs → haiku. Both configurable.
 - One process per task. At most *K* concurrent, default 1 for passive work
   and 1 reserved for on-demand work. On-demand always pre-empts passive.
@@ -218,11 +226,16 @@ re-reviewed or re-documented, even across restarts and branch switches.
 [language-server.llm-lsp]
 command = "llm_lsp"
 
+# Optional; these are the defaults.
+config = { claude = "claude", doc-model = "haiku", doc-tools = ["Read", "Grep", "Glob"] }
+
 [[language]]
 name = "rust"
 language-servers = ["rust-analyzer", "llm-lsp"]
 # …repeat for each language
 ```
+
+`config` arrives as `initializationOptions`.
 
 Commands can be bound to keys with `:lsp-workspace-command`, e.g.
 `"C-r" = ":lsp-workspace-command llm.reviewSymbol"`.
@@ -232,8 +245,8 @@ Commands can be bound to keys with `:lsp-workspace-command`, e.g.
 1. ~~What Helix actually sends~~: answered by the spike (edits and explicit
    requests only).
 2. ~~How Helix shows hovers from multiple servers~~: all of them, switchable.
-3. Typical `claude -p` cold-start latency. Does it make background doc
-   pre-generation for opened files worth doing?
+3. ~~`claude -p` cold-start latency~~: ≈1.4s, ≈2.7s for a whole doc. Fine
+   on demand. Pre-generating docs for opened files isn't needed for now.
 4. Fingerprinting findings so dismissals survive small edits: hash of
    (category + normalized message), or ask the model for a stable id?
 
@@ -242,7 +255,7 @@ Commands can be bound to keys with `:lsp-workspace-command`, e.g.
 1. ~~Spike: logging LSP in Helix~~: done, see `spikes/helix-log/FINDINGS.md`.
 2. LSP skeleton, document sync, tree-sitter symbol lookup for the 4 core
    languages.
-3. Hover docs + SQLite cache + `claude -p` runner.
+3. ~~Hover docs + SQLite cache + `claude -p` runner~~: done.
 4. Activity tracker, leave-event trigger, scheduler.
 5. Passive review → diagnostics → code actions → dismissals.
 6. Notes.
