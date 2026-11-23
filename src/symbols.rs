@@ -89,7 +89,36 @@ pub fn enclosing_symbol(lang: Lang, tree: &Tree, source: &str, byte: usize) -> O
         node = n.parent();
     }
     let (node, kind) = found.or(fallback)?;
+    Some(make_symbol(lang, node, kind, source))
+}
 
+/// Finds the callable whose qualified name is `qualified_name`, wherever it
+/// is now. Used to re-find a symbol after time has passed and the code may
+/// have moved. Returns the first match if names collide (e.g. overloads).
+pub fn find_callable(lang: Lang, tree: &Tree, source: &str, qualified_name: &str) -> Option<Symbol> {
+    // Cheap pre-filter: the bare name must appear in the file.
+    let bare = qualified_name.rsplit(separator(lang)).next()?;
+    if !source.contains(bare) {
+        return None;
+    }
+    let mut cursor = tree.walk();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if let Some(kind) = symbol_kind(lang, node)
+            && kind.is_callable()
+            && symbol_name(lang, node, source).ends_with(bare)
+        {
+            let sym = make_symbol(lang, node, kind, source);
+            if sym.qualified_name == qualified_name {
+                return Some(sym);
+            }
+        }
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
+}
+
+fn make_symbol(lang: Lang, node: Node, kind: SymbolKind, source: &str) -> Symbol {
     // `full` may already be qualified, e.g. C++'s out-of-line `Lru::size`.
     let full = symbol_name(lang, node, source);
     let name = full.rsplit(separator(lang)).next().unwrap_or(&full).to_string();
@@ -105,14 +134,14 @@ pub fn enclosing_symbol(lang: Lang, tree: &Tree, source: &str, byte: usize) -> O
     parts.reverse();
 
     let outer = with_wrapper(node);
-    Some(Symbol {
+    Symbol {
         kind,
         name,
         qualified_name: parts.join(separator(lang)),
         byte_range: outer.byte_range(),
         start: outer.start_position(),
         end: outer.end_position(),
-    })
+    }
 }
 
 fn separator(lang: Lang) -> &'static str {
@@ -394,5 +423,19 @@ mod tests {
             let sym = enclosing_symbol(lang, &tree, &source, byte).unwrap();
             assert_eq!(sym.qualified_name, qualified, "{file}: {needle}");
         }
+    }
+
+    #[test]
+    fn finds_callables_by_qualified_name() {
+        let source = "struct P;\nimpl P {\n    fn term(&self) {}\n}\nfn term() {}\nmod m { fn term() {} }\n";
+        let mut parser = Parser::new();
+        parser.set_language(&Lang::Rust.ts_language()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        for (name, line) in [("P::term", 2), ("term", 4), ("m::term", 5)] {
+            let sym = find_callable(Lang::Rust, &tree, source, name).unwrap();
+            assert_eq!((sym.qualified_name.as_str(), sym.start.row), (name, line));
+        }
+        assert_eq!(find_callable(Lang::Rust, &tree, source, "Q::term"), None);
+        assert_eq!(find_callable(Lang::Rust, &tree, source, "missing"), None);
     }
 }

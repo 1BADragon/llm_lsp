@@ -19,9 +19,10 @@ pub struct Store {
     pool: SqlitePool,
 }
 
-/// Identifies one generated doc.
+/// Identifies one cached doc or review: the exact symbol text it was made
+/// for, and the prompt version that made it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DocKey {
+pub struct CacheKey {
     pub lang: Lang,
     /// `docs::body_hash` of the symbol's text.
     pub body_hash: String,
@@ -29,7 +30,7 @@ pub struct DocKey {
 }
 
 pub struct NewDoc<'a> {
-    pub key: &'a DocKey,
+    pub key: &'a CacheKey,
     pub qualified_name: &'a str,
     pub doc: &'a str,
     pub model: &'a str,
@@ -77,7 +78,7 @@ impl Store {
         Ok(Store { pool })
     }
 
-    pub async fn doc(&self, key: &DocKey) -> Result<Option<String>> {
+    pub async fn doc(&self, key: &CacheKey) -> Result<Option<String>> {
         let row = sqlx::query(
             "SELECT doc FROM docs WHERE lang = ? AND body_hash = ? AND prompt_version = ?",
         )
@@ -105,6 +106,74 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// The cached review's findings (a JSON array), if any.
+    pub async fn review(&self, key: &CacheKey) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT findings FROM reviews WHERE lang = ? AND body_hash = ? AND prompt_version = ?",
+        )
+        .bind(key.lang.name())
+        .bind(&key.body_hash)
+        .bind(key.prompt_version)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("findings")))
+    }
+
+    pub async fn put_review(
+        &self,
+        key: &CacheKey,
+        qualified_name: &str,
+        findings_json: &str,
+        model: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO reviews
+                (lang, body_hash, prompt_version, qualified_name, findings, model, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(key.lang.name())
+        .bind(&key.body_hash)
+        .bind(key.prompt_version)
+        .bind(qualified_name)
+        .bind(findings_json)
+        .bind(model)
+        .bind(unix(SystemTime::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn dismiss(&self, qualified_name: &str, fingerprint: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO dismissals (qualified_name, fingerprint, created_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(qualified_name)
+        .bind(fingerprint)
+        .bind(unix(SystemTime::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// All `(qualified_name, fingerprint)` dismissals.
+    pub async fn dismissals(&self) -> Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as("SELECT qualified_name, fingerprint FROM dismissals")
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// How many runs of `kind` started at or after `since`.
+    pub async fn runs_since(&self, kind: &str, since: SystemTime) -> Result<i64> {
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM runs WHERE kind = ? AND started_at >= ?")
+                .bind(kind)
+                .bind(unix(since))
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n)
     }
 
     pub async fn record_run(&self, run: NewRun<'_>) -> Result<()> {
@@ -145,8 +214,8 @@ fn unix(t: SystemTime) -> i64 {
 mod tests {
     use super::*;
 
-    fn key(hash: &str, version: i64) -> DocKey {
-        DocKey {
+    fn key(hash: &str, version: i64) -> CacheKey {
+        CacheKey {
             lang: Lang::Rust,
             body_hash: hash.into(),
             prompt_version: version,
@@ -173,6 +242,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.doc(&k).await.unwrap().as_deref(), Some("Does f better."));
+    }
+
+    #[tokio::test]
+    async fn reviews_round_trip() {
+        let store = Store::open_in_memory().await.unwrap();
+        let k = key("abc", 1);
+        assert_eq!(store.review(&k).await.unwrap(), None);
+        store.put_review(&k, "P::f", "[]", "sonnet").await.unwrap();
+        assert_eq!(store.review(&k).await.unwrap().as_deref(), Some("[]"));
+        assert_eq!(store.doc(&k).await.unwrap(), None, "separate from docs");
+    }
+
+    #[tokio::test]
+    async fn dismissals_are_idempotent() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.dismiss("P::f", "fp1").await.unwrap();
+        store.dismiss("P::f", "fp1").await.unwrap();
+        store.dismiss("g", "fp2").await.unwrap();
+        let mut d = store.dismissals().await.unwrap();
+        d.sort();
+        assert_eq!(d, [("P::f".into(), "fp1".into()), ("g".into(), "fp2".into())]);
+    }
+
+    #[tokio::test]
+    async fn counts_recent_runs_by_kind() {
+        let store = Store::open_in_memory().await.unwrap();
+        let now = SystemTime::now();
+        for (kind, ago) in [("review", 10), ("review", 7200), ("doc", 10)] {
+            store
+                .record_run(NewRun {
+                    kind,
+                    subject: "f",
+                    model: "m",
+                    started_at: now - Duration::from_secs(ago),
+                    duration: Duration::from_secs(1),
+                    cost_usd: None,
+                    error: None,
+                })
+                .await
+                .unwrap();
+        }
+        let hour_ago = now - Duration::from_secs(3600);
+        assert_eq!(store.runs_since("review", hour_ago).await.unwrap(), 1);
+        assert_eq!(store.runs_since("doc", hour_ago).await.unwrap(), 1);
     }
 
     #[tokio::test]

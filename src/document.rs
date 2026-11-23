@@ -164,7 +164,6 @@ impl Document {
     }
 
     /// Byte offset → LSP position.
-    #[allow(dead_code)] // for publishing diagnostics (build step 5)
     pub fn position_at(&self, offset: usize, enc: Encoding) -> Position {
         let p = self.point_at(offset);
         let character = match enc {

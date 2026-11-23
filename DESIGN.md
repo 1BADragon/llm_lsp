@@ -129,12 +129,14 @@ recently-touched symbols. The main trigger is:
 > for *N* seconds (default ~10s, the only option when I move without typing).
 > It is then queued for review.
 
-Other triggers: `didSave` queues all dirty symbols in that file. Explicit
-commands (`llm.reviewSymbol`, `llm.reviewFile`) bypass the debounce.
+Not yet built: `didSave` queuing all dirty symbols in that file, and explicit
+commands (`llm.reviewSymbol`, `llm.reviewFile`) that bypass the debounce.
 
-**Activity gating.** No passive work runs unless there has been an edit since
-that symbol's last review. When the session has been idle (no signals for
-*M* minutes), the queue is paused, not drained.
+**Idle gating.** Leave events only *queue* reviews. A review starts once
+there has been no activity at all for `review-idle-secs` (default 10s). Reviews
+run one at a time, and the next queued one starts only while I'm still idle.
+So moving on to another function and continuing to type delays reviews of
+the first until I pause. Only edited symbols are ever queued.
 
 ## Features
 
@@ -143,19 +145,29 @@ that symbol's last review. When the session has been idle (no signals for
 - Input: the symbol's text, the file around it (trimmed), project context
   (see below), and relevant notes. The model may read other files with
   read-only tools to check callers and types.
-- Output (structured JSON): a list of findings
-  `{ severity, confidence, anchor_text, message, suggested_fix? }` plus
-  optional `notes`.
-- Only findings at or above the confidence/severity floor are published.
-  `Error` severity is reserved for likely real bugs (UB, logic errors,
-  resource leaks, wrong API use). Style goes to `Hint` or gets dropped.
-- Findings are anchored to the symbol plus the `anchor_text` snippet, not to
-  line numbers. They are re-located after every edit and removed once the
-  symbol's body hash changes, until it is reviewed again.
-- `suggested_fix` becomes a quick-fix code action.
-- A "Dismiss" code action stores a dismissal keyed by
-  `(symbol qualified_name, finding fingerprint)` so the same finding isn't
-  raised again.
+- Output: schema-checked JSON (`claude --json-schema`), a list of findings
+  `{ severity: error|warning|info, confidence: high|medium|low, category,
+  anchor, message, fix? }`. (`notes` not yet.)
+- The prompt asks for real problems only (bugs, leaks, races, security,
+  serious performance traps) and says an empty list is the expected answer.
+  `error` is reserved for very likely real bugs.
+- We then drop: `low` confidence, anchors that aren't a verbatim substring of
+  the function (the model misquoted the code), and duplicates. We keep at most
+  5, most severe first.
+- Reviews are cached like docs: by (language, whitespace-insensitive body
+  hash, prompt version). Re-reviewing unchanged code is free.
+- Findings are anchored to the function plus the `anchor` text, not to line
+  numbers. They are re-located after every edit, and hidden once the
+  function's body hash changes, until it is reviewed again.
+- `fix` (a replacement for exactly the anchor) becomes a quick-fix code
+  action.
+- A "Dismiss" code action (`llm.dismiss`) stores
+  `(qualified_name, fingerprint)`, where fingerprint = hash(category,
+  whitespace-normalized anchor). It survives rewording and reformatting, so
+  the same finding isn't raised again.
+- Budget: `max-reviews-per-hour` (default 20) counts actual model runs.
+  Cache hits are free.
+- Measured (Sonnet): ≈4s and ≈$0.03 per review.
 
 ### Hover docs
 
@@ -227,7 +239,9 @@ re-reviewed or re-documented, even across restarts and branch switches.
 command = "llm_lsp"
 
 # Optional; these are the defaults.
-config = { claude = "claude", doc-model = "haiku", doc-tools = ["Read", "Grep", "Glob"] }
+config = { claude = "claude", doc-model = "haiku", doc-tools = ["Read", "Grep", "Glob"],
+           reviews = true, review-model = "sonnet", review-tools = ["Read", "Grep", "Glob"],
+           review-idle-secs = 10, max-reviews-per-hour = 20 }
 
 [[language]]
 name = "rust"
@@ -247,8 +261,7 @@ Commands can be bound to keys with `:lsp-workspace-command`, e.g.
 2. ~~How Helix shows hovers from multiple servers~~: all of them, switchable.
 3. ~~`claude -p` cold-start latency~~: ≈1.4s, ≈2.7s for a whole doc. Fine
    on demand. Pre-generating docs for opened files isn't needed for now.
-4. Fingerprinting findings so dismissals survive small edits: hash of
-   (category + normalized message), or ask the model for a stable id?
+4. ~~Fingerprinting findings~~: hash of (category, normalized anchor).
 
 ## Build order
 
@@ -257,7 +270,7 @@ Commands can be bound to keys with `:lsp-workspace-command`, e.g.
    languages.
 3. ~~Hover docs + SQLite cache + `claude -p` runner~~: done.
 4. Activity tracker, leave-event trigger, scheduler.
-5. Passive review → diagnostics → code actions → dismissals.
+5. ~~Passive review → diagnostics → code actions → dismissals~~: done.
 6. Notes.
 7. Extra languages.
 

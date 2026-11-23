@@ -28,12 +28,17 @@ pub struct Run {
     /// Built-in tools to enable. They're all pre-approved, so only list
     /// read-only ones.
     pub tools: Vec<String>,
+    /// A JSON Schema the reply must match (`--json-schema`). The validated
+    /// value comes back in [`Output::structured`].
+    pub json_schema: Option<String>,
     pub timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Output {
     pub text: String,
+    /// The schema-validated reply, when `json_schema` was set.
+    pub structured: Option<serde_json::Value>,
     pub cost_usd: Option<f64>,
     pub duration: Duration,
 }
@@ -49,6 +54,16 @@ struct ResultJson {
     result: Option<String>,
     #[serde(default)]
     total_cost_usd: Option<f64>,
+    #[serde(default)]
+    structured_output: Option<serde_json::Value>,
+}
+
+/// A successful run's result, before timing is added.
+#[derive(Debug, PartialEq)]
+struct Parsed {
+    text: String,
+    structured: Option<serde_json::Value>,
+    cost_usd: Option<f64>,
 }
 
 impl Run {
@@ -81,6 +96,9 @@ impl Run {
         .into();
         if !self.tools.is_empty() {
             args.extend(["--allowedTools".into(), tools.clone()]);
+        }
+        if let Some(schema) = &self.json_schema {
+            args.extend(["--json-schema".into(), schema.clone()]);
         }
         args
     }
@@ -124,7 +142,17 @@ impl Run {
 
         let stdout = String::from_utf8_lossy(&out.stdout);
         match parse(&stdout) {
-            Ok((text, cost_usd)) => Ok(Output { text, cost_usd, duration }),
+            Ok(p) => {
+                if self.json_schema.is_some() && p.structured.is_none() {
+                    bail!("claude returned no structured output");
+                }
+                Ok(Output {
+                    text: p.text,
+                    structured: p.structured,
+                    cost_usd: p.cost_usd,
+                    duration,
+                })
+            }
             Err(e) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 bail!("{e:#} (exit {}; stderr: {})", out.status, stderr.trim())
@@ -133,7 +161,7 @@ impl Run {
     }
 }
 
-fn parse(stdout: &str) -> Result<(String, Option<f64>)> {
+fn parse(stdout: &str) -> Result<Parsed> {
     let json = stdout.trim();
     if json.is_empty() {
         bail!("claude produced no output");
@@ -146,8 +174,11 @@ fn parse(stdout: &str) -> Result<(String, Option<f64>)> {
             r.result.as_deref().unwrap_or("no details")
         );
     }
-    let text = r.result.context("claude result has no text")?;
-    Ok((text, r.total_cost_usd))
+    Ok(Parsed {
+        text: r.result.unwrap_or_default(),
+        structured: r.structured_output,
+        cost_usd: r.total_cost_usd,
+    })
 }
 
 #[cfg(test)]
@@ -162,6 +193,7 @@ mod tests {
             system_prompt: "You document code.".into(),
             prompt: "--looks like a flag".into(),
             tools: vec!["Read".into(), "Grep".into()],
+            json_schema: None,
             timeout: Duration::from_secs(1),
         }
     }
@@ -182,6 +214,14 @@ mod tests {
         assert_eq!(value_after(&args, "--allowedTools"), Some("Read,Grep"));
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(!args.contains(&r.prompt), "prompt goes on stdin");
+        assert!(!args.contains(&"--json-schema".to_string()));
+    }
+
+    #[test]
+    fn passes_the_schema() {
+        let mut r = run();
+        r.json_schema = Some(r#"{"type":"object"}"#.into());
+        assert_eq!(value_after(&r.args(), "--json-schema"), Some(r#"{"type":"object"}"#));
     }
 
     #[test]
@@ -197,7 +237,17 @@ mod tests {
     fn parses_success_and_ignores_unknown_fields() {
         let out = r#"{"type":"result","subtype":"success","is_error":false,
             "result":"Adds two numbers.","total_cost_usd":0.00056,"num_turns":1,"new_field":{}}"#;
-        assert_eq!(parse(out).unwrap(), ("Adds two numbers.".into(), Some(0.00056)));
+        assert_eq!(
+            parse(out).unwrap(),
+            Parsed { text: "Adds two numbers.".into(), structured: None, cost_usd: Some(0.00056) }
+        );
+    }
+
+    #[test]
+    fn parses_structured_output() {
+        let out = r#"{"type":"result","subtype":"success","is_error":false,
+            "result":"{\"findings\":[]}","structured_output":{"findings":[]}}"#;
+        assert_eq!(parse(out).unwrap().structured, Some(serde_json::json!({"findings": []})));
     }
 
     #[test]

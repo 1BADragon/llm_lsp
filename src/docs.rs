@@ -58,20 +58,8 @@ pub fn body_hash(text: &str) -> String {
 pub fn prompt(req: &DocRequest) -> String {
     let sym = req.symbol;
     let lang = req.lang.name();
-    let mut out = String::new();
-
-    for (name, text) in req.context {
-        out.push_str(&format!(
-            "Project context from {name}:\n<context file=\"{name}\">\n{}\n</context>\n\n",
-            truncate(text, MAX_CONTEXT_FILE)
-        ));
-    }
-
-    out.push_str(&format!(
-        "File: {} ({lang})\n<file>\n{}\n</file>\n\n",
-        req.path.display(),
-        file_excerpt(req.file_text, sym)
-    ));
+    let mut out = context_section(req.context);
+    out.push_str(&file_section(req.path, req.lang, req.file_text, sym));
     out.push_str(&format!(
         "Document this {lang} {kind}: `{name}` (lines {start}-{end} of the file):\n<symbol>\n{body}\n</symbol>\n",
         kind = format!("{:?}", sym.kind).to_lowercase(),
@@ -81,6 +69,29 @@ pub fn prompt(req: &DocRequest) -> String {
         body = &req.file_text[sym.byte_range.clone()],
     ));
     out
+}
+
+/// Project context files (`CLAUDE.md`, …) as prompt sections.
+pub fn context_section(context: &[(String, String)]) -> String {
+    context
+        .iter()
+        .map(|(name, text)| {
+            format!(
+                "Project context from {name}:\n<context file=\"{name}\">\n{}\n</context>\n\n",
+                truncate(text, MAX_CONTEXT_FILE)
+            )
+        })
+        .collect()
+}
+
+/// The file containing `sym`, whole or excerpted, as a prompt section.
+pub fn file_section(path: &Path, lang: Lang, file_text: &str, sym: &Symbol) -> String {
+    format!(
+        "File: {} ({})\n<file>\n{}\n</file>\n\n",
+        path.display(),
+        lang.name(),
+        file_excerpt(file_text, sym)
+    )
 }
 
 /// The whole file when it's small, else the lines around the symbol.

@@ -100,6 +100,8 @@ pub struct ActivityTracker {
     dirty: HashMap<SymbolId, Instant>,
     /// Bulk edits waiting out `formatter_window`.
     held: Vec<HeldEdit>,
+    /// The newest signal of any kind.
+    last_activity: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -117,10 +119,15 @@ impl ActivityTracker {
             focus_at: None,
             dirty: HashMap::new(),
             held: Vec::new(),
+            last_activity: None,
         }
     }
 
     pub fn record(&mut self, signal: Signal) {
+        let at = match &signal {
+            Signal::Edit { at, .. } | Signal::Request { at, .. } | Signal::Save { at, .. } => *at,
+        };
+        self.last_activity = Some(self.last_activity.map_or(at, |t| t.max(at)));
         match signal {
             Signal::Edit {
                 uri,
@@ -171,6 +178,12 @@ impl ActivityTracker {
             self.dirty.remove(s);
         }
         left.into_iter().map(|symbol| LeaveEvent { symbol }).collect()
+    }
+
+    /// How long since any signal at all (`Duration::MAX` before the first).
+    pub fn idle_for(&self, now: Instant) -> Duration {
+        self.last_activity
+            .map_or(Duration::MAX, |t| now.saturating_duration_since(t))
     }
 
     /// The symbol I'm currently working in, if known.
@@ -398,5 +411,15 @@ mod tests {
         assert!(t.tick(0.5).is_empty());
         assert_eq!(t.tracker.focus(), Some(&sym("a")));
         assert_eq!(t.tick(10.5), ["a"]);
+    }
+
+    #[test]
+    fn idle_time_counts_from_the_newest_signal() {
+        let mut t = T::new();
+        assert_eq!(t.tracker.idle_for(t.at(0.0)), Duration::MAX);
+        t.edit(1.0, &["a"]);
+        t.hover(3.0, None);
+        t.save(2.0); // out of order: doesn't move it back
+        assert_eq!(t.tracker.idle_for(t.at(5.0)), Duration::from_secs(2));
     }
 }
