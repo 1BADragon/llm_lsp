@@ -20,7 +20,9 @@ use it, not a line-by-line account of how.
 - Add more only when it helps a caller: non-obvious behavior, parameters, \
 return value, errors or exceptions, panics, safety requirements, side \
 effects. Follow the language's documentation conventions (e.g. Rust \
-`# Errors` / `# Panics` / `# Safety` sections, Python Args/Returns/Raises).
+`# Errors` / `# Panics` / `# Safety` sections, Python Args/Returns/Raises, \
+JSDoc `@param` / `@returns` only where they add something TypeScript types \
+don't).
 - Be brief: usually 1-6 lines. Don't restate the signature or types.
 - Don't guess. The surrounding file is provided. If behavior depends on code \
 elsewhere, you may look it up with the read-only tools, but only when it \
@@ -66,7 +68,7 @@ pub fn prompt(req: &DocRequest) -> String {
     out.push_str(&file_section(req.path, req.lang, req.file_text, sym));
     out.push_str(&format!(
         "Document this {lang} {kind}: `{name}` (lines {start}-{end} of the file):\n<symbol>\n{body}\n</symbol>\n",
-        kind = sym.kind.label(),
+        kind = sym.kind.label(req.lang),
         name = sym.qualified_name,
         start = sym.start.row + 1,
         end = sym.end.row + 1,

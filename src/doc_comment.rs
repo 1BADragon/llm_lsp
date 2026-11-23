@@ -33,7 +33,9 @@ pub fn doc_edit(lang: Lang, tree: &Tree, source: &str, symbol: &Symbol, doc: &st
     }
     match lang {
         Lang::Python => python_edit(tree, source, symbol, doc),
-        Lang::Rust | Lang::C | Lang::Cpp => above_edit(lang, source, symbol, doc),
+        Lang::Rust | Lang::C | Lang::Cpp | Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+            above_edit(lang, source, symbol, doc)
+        }
     }
 }
 
@@ -47,9 +49,18 @@ fn above_edit(lang: Lang, source: &str, symbol: &Symbol, doc: &str) -> Option<Do
         _ => c_comment(&wrap(doc, text_width(indent, 3)), indent),
     };
 
-    // Walk up over attributes (Rust) to find where docs are, or would go.
+    // Walk up over attributes (Rust `#[…]`) or decorators (JS/TS `@…`)
+    // to find where docs are, or would go.
+    let attribute = match lang {
+        Lang::Rust => Some("#["),
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => Some("@"),
+        _ => None,
+    };
     let mut top = def_line;
-    while lang == Lang::Rust && top > 0 && line(source, &lines, top - 1).starts_with("#[") {
+    while let Some(prefix) = attribute
+        && top > 0
+        && line(source, &lines, top - 1).starts_with(prefix)
+    {
         top -= 1;
     }
     // An existing doc comment ends right above `top` (Rust docs usually sit
@@ -94,7 +105,8 @@ fn existing_doc_above(lang: Lang, source: &str, lines: &[Range<usize>], anchor: 
 }
 
 fn is_line_doc(trimmed: &str) -> bool {
-    trimmed.starts_with("///") && !trimmed.starts_with("////")
+    // `/// <reference … />` is a TypeScript directive, not documentation.
+    trimmed.starts_with("///") && !trimmed.starts_with("////") && !trimmed.starts_with("/// <")
 }
 
 fn rust_comment(doc: &str, indent: &str) -> String {
@@ -412,5 +424,34 @@ mod tests {
         assert!(out.lines().all(|l| l.len() <= 80));
         assert!(out.contains("        \"\"\"Parses a single operand"), "{out}");
         assert!(out.contains("\n        \"\"\"\n"), "multi-line docstring closes on its own line: {out}");
+    }
+
+    #[test]
+    fn js_jsdoc_goes_above_export_and_decorators() {
+        let (out, replaces) = apply(Lang::TypeScript, "export const load = async () => { |go(); };\n", "Loads it.");
+        assert!(!replaces);
+        assert_eq!(out, "/**\n * Loads it.\n */\nexport const load = async () => { go(); };\n");
+
+        let (out, _) = apply(Lang::TypeScript, "class D {\n  @log\n  method() { | }\n}\n", "Does it.");
+        assert_eq!(out, "class D {\n  /**\n   * Does it.\n   */\n  @log\n  method() {  }\n}\n");
+    }
+
+    #[test]
+    fn js_replaces_jsdoc_but_not_reference_directives() {
+        let (out, replaces) = apply(
+            Lang::JavaScript,
+            "/**\n * Old.\n * @param {number} x\n */\nfunction f(x) { return |x; }\n",
+            "New.",
+        );
+        assert!(replaces);
+        assert_eq!(out, "/**\n * New.\n */\nfunction f(x) { return x; }\n");
+
+        let (out, replaces) = apply(
+            Lang::TypeScript,
+            "/// <reference types=\"node\" />\nfunction f() { | }\n",
+            "New.",
+        );
+        assert!(!replaces, "a triple-slash directive isn't a doc comment");
+        assert!(out.starts_with("/// <reference types=\"node\" />\n/**\n * New.\n */\nfunction f()"));
     }
 }

@@ -47,10 +47,13 @@ It uses an LLM to:
 
 - Editor: Helix (25.07+). It runs as an extra language server next to
   rust-analyzer, clangd, etc.
-- Languages: Rust, C, C++, Python required. Also go, JavaScript, TypeScript/TSX,
-  Java, C#, Ruby, Lua, Bash, Zig, where a tree-sitter grammar crate is
-  available. Any other language falls back to line-window mode (see
-  [Code structure](#code-structure)).
+- Languages: Rust, C, C++, Python, JavaScript (incl. JSX), TypeScript and TSX
+  are supported. Helix language ids `javascript`/`javascriptreact` share the
+  JavaScript grammar, and `typescriptreact` is TSX. Candidates for later:
+  Go, Java, C#, Ruby, Lua, Bash, Zig. HTML/CSS have no symbols to review;
+  Vue/Svelte single-file components embed several languages and would need
+  separate handling. Unsupported languages are simply ignored (the planned
+  line-window fallback isn't built).
 
 ## Architecture overview
 
@@ -148,12 +151,20 @@ the first until I pause. Only edited symbols are ever queued.
 ## Features
 
 **What's reviewable (and documentable):** functions, methods, plain type
-definitions, and Rust traits. Plain types are Rust struct/enum/union/type
-alias, and C/C++ struct/union/enum without member functions. An anonymous C
-struct is named by its `typedef`. Not yet: classes (C++ `class` or structs
-with member functions, Python `class`), whose methods are covered one by one.
-The plan is to review a class as a "header" with method bodies left out.
-Modules and macros are out.
+definitions, and traits/interfaces.
+- Plain types are Rust struct/enum/union/type alias, C/C++ struct/union/enum
+  without member functions, TS type aliases and enums, and JS/TS classes
+  without methods. An anonymous C struct is named by its `typedef`.
+- JS/TS functions include `const f = () => …` / `= function …`, and
+  `export default function` (named `default` when anonymous). Methods
+  include object-literal methods (`api.get`) and arrow-function class fields.
+  Inline callbacks belong to their enclosing function. Definitions include
+  their `export` / `const` / `declare` wrapper. A TS overload signature
+  defers to the implementation.
+- Not yet: classes with methods (C++ `class` or structs with member
+  functions, Python and JS/TS classes with methods), whose methods are
+  covered one by one. The plan is to review a class as a "header" with
+  method bodies left out. Modules, namespaces and macros are out.
 
 ### Passive review → diagnostics
 

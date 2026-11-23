@@ -30,7 +30,8 @@ CLI headlessly. Built for [Helix](https://helix-editor.com); see
   project ("errors use `anyhow` at the boundary") for later reviews, and
   retire notes the code contradicts. You can read and edit them.
 
-Supported languages: Rust, C, C++, Python.
+Supported languages: Rust, C, C++, Python, JavaScript, TypeScript, JSX and
+TSX.
 
 ## Requirements
 
@@ -76,6 +77,11 @@ language-servers = ["clangd", "llm-lsp"]
 [[language]]
 name = "python"
 language-servers = ["pyright", "ruff", "llm-lsp"]
+
+# Likewise for "jsx", "typescript" and "tsx".
+[[language]]
+name = "javascript"
+language-servers = ["typescript-language-server", "llm-lsp"]
 ```
 
 Check with `hx --health rust`.
@@ -159,8 +165,8 @@ cargo test -- --include-ignored  # also calls the real claude CLI (fractions of 
 playground/run.sh
 ```
 
-`run.sh` builds the server and opens a small playground (Rust, C, C++ and
-Python files with deliberate bugs) in Helix, with a workspace config that
+`run.sh` builds the server and opens a small playground (Rust, C, C++,
+Python, TypeScript and JSX files with deliberate bugs) in Helix, with a workspace config that
 uses the debug build. Run `:workspace-trust` in it once.
 
 ## License

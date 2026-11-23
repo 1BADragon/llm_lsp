@@ -32,6 +32,9 @@ Report only issues that matter:
 unhandled error or edge cases that will happen in practice
 - resource leaks, races, security holes
 - serious performance traps (e.g. accidentally quadratic on real inputs)
+- in JavaScript/TypeScript: a missing `await`, unhandled promise \
+rejections, stale closures or missing React hook dependencies, and `any` or \
+`as` casts that hide a real type error
 - for type definitions and traits: a field or variant type that can't \
 hold the values it will need to, ownership or lifetime mistakes, a missing \
 `Drop`/`Clone`/`Copy`/derive that callers in the provided code rely on, \
@@ -186,7 +189,7 @@ pub fn prompt(req: &ReviewRequest) -> String {
     out.push_str(&format!(
         "Review this {lang} {kind} that was just edited: `{name}` (lines {start}-{end} of the file):\n<code>\n{body}\n</code>\n",
         lang = req.lang.name(),
-        kind = sym.kind.label(),
+        kind = sym.kind.label(req.lang),
         name = sym.qualified_name,
         start = sym.start.row + 1,
         end = sym.end.row + 1,

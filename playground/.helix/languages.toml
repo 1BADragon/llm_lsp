@@ -23,3 +23,19 @@ language-servers = ["clangd", "llm-lsp"]
 [[language]]
 name = "cpp"
 language-servers = ["clangd", "llm-lsp"]
+
+[[language]]
+name = "javascript"
+language-servers = ["typescript-language-server", "llm-lsp"]
+
+[[language]]
+name = "jsx"
+language-servers = ["typescript-language-server", "llm-lsp"]
+
+[[language]]
+name = "typescript"
+language-servers = ["typescript-language-server", "llm-lsp"]
+
+[[language]]
+name = "tsx"
+language-servers = ["typescript-language-server", "llm-lsp"]

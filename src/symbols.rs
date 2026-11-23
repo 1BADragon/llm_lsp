@@ -40,7 +40,7 @@ pub enum SymbolKind {
     /// A class with methods in its body: C++ `class` (or a struct with member
     /// functions), Python `class`. Its methods are symbols of their own.
     Class,
-    /// Rust trait.
+    /// Rust trait, TypeScript interface.
     Interface,
     Module,
     Macro,
@@ -62,13 +62,14 @@ impl SymbolKind {
     }
 
     /// How prompts and messages name this kind.
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
         match self {
             SymbolKind::Function => "function",
             SymbolKind::Method => "method",
             SymbolKind::Type => "type definition",
             SymbolKind::Class => "class",
-            SymbolKind::Interface => "trait",
+            SymbolKind::Interface if lang == Lang::Rust => "trait",
+            SymbolKind::Interface => "interface",
             SymbolKind::Module => "module",
             SymbolKind::Macro => "macro",
         }
@@ -130,6 +131,7 @@ pub fn find_reviewable(lang: Lang, tree: &Tree, source: &str, qualified_name: &s
     }
     let mut cursor = tree.walk();
     let mut stack = vec![tree.root_node()];
+    let mut bodiless = None;
     while let Some(node) = stack.pop() {
         if let Some(kind) = symbol_kind(lang, node)
             && kind.is_reviewable()
@@ -137,12 +139,31 @@ pub fn find_reviewable(lang: Lang, tree: &Tree, source: &str, qualified_name: &s
         {
             let sym = make_symbol(lang, node, kind, source);
             if sym.qualified_name == qualified_name {
-                return Some(sym);
+                // A TypeScript overload signature shares its name with the
+                // implementation; prefer the one with a body.
+                if is_signature(node) {
+                    bodiless.get_or_insert(sym);
+                } else {
+                    return Some(sym);
+                }
             }
         }
         stack.extend(node.named_children(&mut cursor));
     }
-    None
+    bodiless
+}
+
+fn is_signature(node: Node) -> bool {
+    matches!(node.kind(), "function_signature" | "method_signature" | "abstract_method_signature")
+}
+
+fn is_js(lang: Lang) -> bool {
+    matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
+}
+
+/// `() => …`, `function () {…}`, `function* () {…}`.
+fn is_function_value(node: Option<Node>) -> bool {
+    node.is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "generator_function"))
 }
 
 fn make_symbol(lang: Lang, node: Node, kind: SymbolKind, source: &str) -> Symbol {
@@ -173,7 +194,7 @@ fn make_symbol(lang: Lang, node: Node, kind: SymbolKind, source: &str) -> Symbol
 
 fn separator(lang: Lang) -> &'static str {
     match lang {
-        Lang::Python => ".",
+        Lang::Python | Lang::JavaScript | Lang::TypeScript | Lang::Tsx => ".",
         Lang::Rust | Lang::C | Lang::Cpp => "::",
     }
 }
@@ -220,7 +241,7 @@ fn symbol_kind(lang: Lang, node: Node) -> Option<SymbolKind> {
         // functions is really a class.
         (Lang::C | Lang::Cpp, "struct_specifier" | "union_specifier" | "enum_specifier") => {
             let body = node.child_by_field_name("body")?;
-            if lang == Lang::Cpp && has_member_functions(body) {
+            if lang == Lang::Cpp && has_member_functions(lang, body) {
                 Class
             } else {
                 Type
@@ -236,6 +257,42 @@ fn symbol_kind(lang: Lang, node: Node) -> Option<SymbolKind> {
         }
         (Lang::Python, "class_definition") => Class,
 
+        // JavaScript / TypeScript.
+        (l, "function_declaration" | "generator_function_declaration" | "function_signature") if is_js(l) => {
+            Function
+        }
+        // `const f = () => …`, `let g = function () {…}`.
+        (l, "variable_declarator")
+            if is_js(l)
+                && is_function_value(node.child_by_field_name("value"))
+                && node.child_by_field_name("name").is_some_and(|n| n.kind() == "identifier") =>
+        {
+            Function
+        }
+        // `export default function () {…}` / `export default () => …`.
+        (l, "function_expression" | "arrow_function")
+            if is_js(l) && node.parent().is_some_and(|p| p.kind() == "export_statement") =>
+        {
+            Function
+        }
+        (l, "method_definition" | "method_signature" | "abstract_method_signature") if is_js(l) => Method,
+        // Class fields and object properties holding functions:
+        // `handle = () => {…}`, `{ bar: () => 1 }`.
+        (l, "field_definition" | "public_field_definition" | "pair")
+            if is_js(l) && is_function_value(node.child_by_field_name("value")) =>
+        {
+            Method
+        }
+        (l, "class_declaration" | "abstract_class_declaration") if is_js(l) => {
+            match node.child_by_field_name("body") {
+                Some(body) if has_member_functions(lang, body) => Class,
+                _ => Type,
+            }
+        }
+        (l, "interface_declaration") if is_js(l) => Interface,
+        (l, "type_alias_declaration" | "enum_declaration") if is_js(l) => Type,
+        (l, "internal_module") if is_js(l) => Module,
+
         _ => return None,
     };
     Some(kind)
@@ -250,6 +307,14 @@ fn container_name(lang: Lang, node: Node, source: &str) -> Option<String> {
         (Lang::Rust, "impl_item") => node
             .child_by_field_name("type")
             .map(|t| rust_type_name(t, source)),
+        // `const api = { get() {…} }` qualifies its methods: `api.get`.
+        (l, "variable_declarator")
+            if is_js(l) && node.child_by_field_name("value").is_some_and(|v| v.kind() == "object") =>
+        {
+            node.child_by_field_name("name")
+                .filter(|n| n.kind() == "identifier")
+                .map(|n| text(n, source).to_string())
+        }
         // Anonymous namespaces add nothing.
         (Lang::Cpp, "namespace_definition") => node
             .child_by_field_name("name")
@@ -261,10 +326,13 @@ fn container_name(lang: Lang, node: Node, source: &str) -> Option<String> {
 fn symbol_name(lang: Lang, node: Node, source: &str) -> String {
     let name_node = match (lang, node.kind()) {
         (Lang::C | Lang::Cpp, "function_definition") => declarator_name_node(node),
+        (l, "field_definition") if is_js(l) => node.child_by_field_name("property"),
+        (l, "pair") if is_js(l) => node.child_by_field_name("key"),
         _ => node.child_by_field_name("name"),
     };
     match name_node {
         Some(n) => strip_template_args(text(n, source)),
+        None if node.parent().is_some_and(|p| p.kind() == "export_statement") => "default".to_string(),
         // `typedef struct { … } ring_t;` is known by its typedef name.
         None => typedef_name(node, source).unwrap_or_else(|| "<anonymous>".to_string()),
     }
@@ -276,14 +344,19 @@ fn typedef_name(node: Node, source: &str) -> Option<String> {
     (declarator.kind() == "type_identifier").then(|| text(declarator, source).to_string())
 }
 
-/// Does a C++ struct/union body define or declare member functions?
-fn has_member_functions(body: Node) -> bool {
+/// Does a C++ struct/union body or a JS/TS class body define or declare
+/// member functions?
+fn has_member_functions(lang: Lang, body: Node) -> bool {
     let mut cursor = body.walk();
     body.named_children(&mut cursor).any(|member| match member.kind() {
-        "function_definition" | "template_declaration" => true,
-        "field_declaration" | "declaration" => member
+        "function_definition" | "template_declaration" => lang == Lang::Cpp,
+        "field_declaration" | "declaration" if lang == Lang::Cpp => member
             .child_by_field_name("declarator")
             .is_some_and(|d| d.kind() == "function_declarator"),
+        "method_definition" | "method_signature" | "abstract_method_signature" => true,
+        "field_definition" | "public_field_definition" => {
+            is_function_value(member.child_by_field_name("value"))
+        }
         _ => false,
     })
 }
@@ -335,13 +408,25 @@ fn parent_body_of(node: Node, containers: &[&str]) -> bool {
 }
 
 /// The definition including wrapper nodes that belong to it: decorators,
-/// `template <…>`, and a `typedef` around a struct.
+/// `template <…>`, a `typedef` around a struct, and JS/TS
+/// `export` / `const` / `declare`.
 fn with_wrapper(node: Node) -> Node {
-    match node.parent() {
-        Some(p) if matches!(p.kind(), "decorated_definition" | "template_declaration") => p,
-        Some(p) if p.kind() == "type_definition" && p.child_by_field_name("type") == Some(node) => p,
-        _ => node,
+    let mut node = node;
+    while let Some(p) = node.parent() {
+        let wraps = match p.kind() {
+            "decorated_definition" | "template_declaration" => true,
+            "type_definition" => p.child_by_field_name("type") == Some(node),
+            // `const f = …` / `export …` / `declare …` around a JS/TS definition.
+            "lexical_declaration" | "variable_declaration" => p.named_child_count() == 1,
+            "export_statement" | "ambient_declaration" => true,
+            _ => false,
+        };
+        if !wraps {
+            break;
+        }
+        node = p;
     }
+    node
 }
 
 /// `LruCache<K, V>::get` → `LruCache::get`.
@@ -467,6 +552,79 @@ mod tests {
         assert_eq!(at_cursor(l, "import os|\n"), None);
     }
 
+    #[test]
+    fn javascript() {
+        use SymbolKind::*;
+        let l = Lang::JavaScript;
+        expect(l, "function f(a) { return |a; }", Function, "f");
+        expect(l, "function* gen() { yield |1; }", Function, "gen");
+        expect(l, "const h = (x) => x |* 2;", Function, "h");
+        expect(l, "export const load = async () => { await |go(); };", Function, "load");
+        expect(l, "let fe = function named() { |};", Function, "fe");
+        expect(l, "export default function () { |}", Function, "default");
+        expect(l, "class A {\n  static m() { |}\n}", Method, "A.m");
+        expect(l, "class A {\n  get v() { return |1; }\n}", Method, "A.v");
+        expect(l, "class A {\n  handle = () => { |};\n}", Method, "A.handle");
+        expect(l, "class A {\n  #secret() { |}\n}", Method, "A.#secret");
+        expect(l, "class A {\n  x = |1;\n  m() {}\n}", Class, "A");
+        expect(l, "class Point {\n  x = |0;\n}", Type, "Point");
+        expect(l, "const api = { get() { |} };", Method, "api.get");
+        expect(l, "const api = { put: (x) => |x };", Method, "api.put");
+        // Inline callbacks belong to their enclosing function or component.
+        expect(l, "function f() { items.map((x) => |x + 1); }", Function, "f");
+        expect(l, "const Comp = () => <div onClick={() => |go()}>hi</div>;", Function, "Comp");
+        expect(l, "function outer() { const inner = () => |1; }", Function, "outer.inner");
+        assert_eq!(at_cursor(l, "import x from 'y';|\n"), None);
+        assert_eq!(at_cursor(l, "const n = |1;"), None, "a plain constant isn't a symbol");
+    }
+
+    #[test]
+    fn typescript() {
+        use SymbolKind::*;
+        let l = Lang::TypeScript;
+        expect(l, "interface I {\n  p: |string;\n}", Interface, "I");
+        expect(l, "interface I {\n  m(a: number): |void;\n}", Method, "I.m");
+        expect(l, "type T = { a: |number };", Type, "T");
+        expect(l, "enum E { A, |B }", Type, "E");
+        expect(l, "namespace N { export function f(): void { | } }", Function, "N.f");
+        expect(l, "abstract class K {\n  abstract m(): |void;\n}", Method, "K.m");
+        expect(l, "class K {\n  private x = |1;\n  m() {}\n}", Class, "K");
+        expect(l, "class D {\n  @log method() { | }\n}", Method, "D.method");
+        expect(l, "class C {\n  handle = (e: Event) => { | };\n}", Method, "C.handle");
+        expect(l, "export const id = <T,>(x: T): T => |x;", Function, "id");
+        let sym = at_cursor(l, "export function f(): void { | }").unwrap();
+        assert!(sym.byte_range.start == 0, "the export is part of the definition");
+    }
+
+    #[test]
+    fn tsx() {
+        use SymbolKind::*;
+        let l = Lang::Tsx;
+        expect(
+            l,
+            "export const Button = ({ label }: Props) => <button>{|label}</button>;",
+            Function,
+            "Button",
+        );
+        expect(l, "export function App() { return <div onClick={() => |go()} />; }", Function, "App");
+    }
+
+    #[test]
+    fn overloads_resolve_to_the_implementation() {
+        let source = "function ov(a: string): void;\nfunction ov(a: any) { return a; }\n";
+        let mut parser = Parser::new();
+        parser.set_language(&Lang::TypeScript.ts_language()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let sym = find_reviewable(Lang::TypeScript, &tree, source, "ov").unwrap();
+        assert_eq!(sym.start.row, 1);
+    }
+
+    #[test]
+    fn interface_label_depends_on_language() {
+        assert_eq!(SymbolKind::Interface.label(Lang::Rust), "trait");
+        assert_eq!(SymbolKind::Interface.label(Lang::TypeScript), "interface");
+    }
+
     /// Every function in the playground files resolves to itself.
     #[test]
     fn playground_files() {
@@ -477,6 +635,9 @@ mod tests {
             (Lang::C, "c/ring.c", "r->len--", "ring_pop"),
             (Lang::Cpp, "c/lru.cpp", "order_.emplace_front", "LruCache::put"),
             (Lang::Python, "py/inventory.py", "item.qty -= qty", "Inventory.remove"),
+            (Lang::TypeScript, "web/cart.ts", "pay(this.total());", "Cart.checkout"),
+            (Lang::TypeScript, "web/cart.ts", "toFixed(2)", "formatPrice"),
+            (Lang::JavaScript, "web/Counter.jsx", "setCount(count + step)", "Counter"),
         ];
         for &(lang, file, needle, qualified) in cases {
             let source = std::fs::read_to_string(format!("{root}{file}")).unwrap();

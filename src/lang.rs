@@ -8,6 +8,11 @@ pub enum Lang {
     C,
     Cpp,
     Python,
+    /// JavaScript, including JSX.
+    JavaScript,
+    TypeScript,
+    /// TypeScript with JSX.
+    Tsx,
 }
 
 impl Lang {
@@ -18,6 +23,9 @@ impl Lang {
             "c" => Some(Lang::C),
             "cpp" => Some(Lang::Cpp),
             "python" => Some(Lang::Python),
+            "javascript" | "javascriptreact" => Some(Lang::JavaScript),
+            "typescript" => Some(Lang::TypeScript),
+            "typescriptreact" => Some(Lang::Tsx),
             _ => None,
         }
     }
@@ -29,6 +37,9 @@ impl Lang {
             Lang::C => "c",
             Lang::Cpp => "cpp",
             Lang::Python => "python",
+            Lang::JavaScript => "javascript",
+            Lang::TypeScript => "typescript",
+            Lang::Tsx => "tsx",
         }
     }
 
@@ -38,6 +49,9 @@ impl Lang {
             Lang::C => tree_sitter_c::LANGUAGE.into(),
             Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             Lang::Python => tree_sitter_python::LANGUAGE.into(),
+            Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         }
     }
 }
@@ -49,6 +63,9 @@ mod tests {
     #[test]
     fn helix_language_ids() {
         assert_eq!(Lang::from_language_id("cpp"), Some(Lang::Cpp));
+        assert_eq!(Lang::from_language_id("javascriptreact"), Some(Lang::JavaScript));
+        assert_eq!(Lang::from_language_id("typescriptreact"), Some(Lang::Tsx));
         assert_eq!(Lang::from_language_id("toml"), None);
     }
 }
+
