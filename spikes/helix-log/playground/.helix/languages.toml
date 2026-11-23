@@ -6,18 +6,24 @@
 command = "/home/matt/Workspace/llm_lsp/spikes/helix-log/target/release/helix-log"
 environment = { LLM_LSP_SPIKE_DIR = "/home/matt/Workspace/llm_lsp/spikes/helix-log/playground/logs" }
 
+# The real server. To rerun the spike instead, swap `llm-lsp` for `helix-log`
+# in the language lists below.
+[language-server.llm-lsp]
+command = "/home/matt/Workspace/llm_lsp/target/debug/llm_lsp"
+environment = { RUST_LOG = "llm_lsp=debug" }
+
 [[language]]
 name = "rust"
-language-servers = ["rust-analyzer", "helix-log"]
+language-servers = ["rust-analyzer", "llm-lsp"]
 
 [[language]]
 name = "python"
-language-servers = ["pyright", "ruff", "helix-log"]
+language-servers = ["pyright", "ruff", "llm-lsp"]
 
 [[language]]
 name = "c"
-language-servers = ["clangd", "helix-log"]
+language-servers = ["clangd", "llm-lsp"]
 
 [[language]]
 name = "cpp"
-language-servers = ["clangd", "helix-log"]
+language-servers = ["clangd", "llm-lsp"]
