@@ -1,15 +1,16 @@
-# Workspace-local Helix config: only applies when hx is run from this folder.
+# Workspace-local Helix config: only applies when hx is run from this folder
+# (run.sh does that). Paths are relative to this folder.
 # `language-servers` replaces the list for each language, so the usual servers
 # are kept in it.
 
 [language-server.helix-log]
-command = "/home/matt/Workspace/llm_lsp/spikes/helix-log/target/release/helix-log"
-environment = { LLM_LSP_SPIKE_DIR = "/home/matt/Workspace/llm_lsp/spikes/helix-log/playground/logs" }
+command = "../target/release/helix-log"
+environment = { LLM_LSP_SPIKE_DIR = "logs" }
 
 # The real server. To rerun the spike instead, swap `llm-lsp` for `helix-log`
 # in the language lists below.
 [language-server.llm-lsp]
-command = "/home/matt/Workspace/llm_lsp/target/debug/llm_lsp"
+command = "../../../target/debug/llm_lsp"
 environment = { RUST_LOG = "llm_lsp=debug" }
 
 [[language]]
