@@ -2,6 +2,7 @@
 
 mod activity;
 mod claude;
+mod doc_comment;
 mod docs;
 mod document;
 mod lang;

@@ -94,6 +94,10 @@ Check with `hx --health rust`.
   - `llm_lsp: dismiss: …` hides a finding permanently. It survives
     rewording and reformatting.
   - ``llm_lsp: review `name` `` reviews the symbol under the cursor right now.
+  - `llm_lsp: insert doc comment` writes the doc into the code (`///` in
+    Rust, `/** */` in C/C++, a docstring in Python), wrapped to 80 columns.
+    It replaces an existing doc comment. If the doc isn't cached yet it says
+    "generate and insert" and generates it first.
 - **Commands** (`:lsp-workspace-command` opens a picker):
   - `llm.reviewSymbol`: review the function you last edited or hovered,
     now. It skips the idle wait and the hourly cap, and always reports the

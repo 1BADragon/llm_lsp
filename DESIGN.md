@@ -190,8 +190,18 @@ Modules and macros are out.
   immediately.
 - On a miss it returns a short "generating…" hover at once and starts
   generation in the background. The next hover hits the cache.
-- Code action "Insert doc comment" writes the cached doc in the language's
-  doc-comment style (`///`, `/** */`, docstring, …).
+- Code action "insert doc comment" writes the doc into the source:
+  - Formats: Rust `///` lines placed above any `#[…]` attributes, C/C++ a
+    `/** … */` block, Python a docstring as the first statement.
+  - Indented to match, and wrapped to 80 columns. Lists get a hanging
+    indent; code blocks, headings and tables are left alone.
+  - An existing doc comment (`///` lines, `/** */`, a docstring) is replaced
+    rather than duplicated, and the action says "replace". Plain comments
+    are left alone.
+  - Cached doc: the action carries the edit and applies instantly.
+    Otherwise it's "generate and insert", which runs `llm.insertDoc`: it
+    generates the doc (with progress), then sends `workspace/applyEdit`,
+    with positions computed from the text at that moment.
 - Helix shows hovers from every server and lets you switch between them, so
   the plain `textDocument/hover` is enough.
 

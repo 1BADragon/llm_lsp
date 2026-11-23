@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::activity::{self, ActivityTracker, Signal, SymbolId};
 use crate::claude;
+use crate::doc_comment;
 use crate::docs::{self, DocRequest};
 use crate::document::{Document, Encoding};
 use crate::lang::Lang;
@@ -36,6 +37,9 @@ const DISMISS_COMMAND: &str = "llm.dismiss";
 /// Review a function now. Arguments: `[uri, qualified_name]`, or none for
 /// the function in focus (what `:lsp-workspace-command` sends).
 const REVIEW_COMMAND: &str = "llm.reviewSymbol";
+/// Generate a doc (if not cached) and insert it as a doc comment.
+/// Arguments: `[uri, qualified_name]`.
+const INSERT_DOC_COMMAND: &str = "llm.insertDoc";
 /// Open the notes as an editable Markdown file.
 const SHOW_NOTES_COMMAND: &str = "llm.showNotes";
 /// Delete every note for the project (asks first).
@@ -678,6 +682,123 @@ impl State {
         )
     }
 
+    /// The doc comment edit for `qualified_name` in the current text of `uri`,
+    /// and whether it replaces an existing doc comment.
+    fn doc_text_edit(&self, uri: &Uri, qualified_name: &str, doc: &str) -> Option<(TextEdit, bool)> {
+        let docs = self.docs.lock().unwrap();
+        let document = docs.get(uri)?;
+        let (lang, tree) = (document.lang?, document.tree()?);
+        let symbol = symbols::find_reviewable(lang, tree, document.text(), qualified_name)?;
+        let edit = doc_comment::doc_edit(lang, tree, document.text(), &symbol, doc)?;
+        let enc = self.encoding();
+        let range = Range::new(
+            document.position_at(edit.range.start, enc),
+            document.position_at(edit.range.end, enc),
+        );
+        Some((TextEdit { range, new_text: edit.text }, edit.replaces))
+    }
+
+    /// "Insert doc comment" for `symbol`: an instant edit when its doc is
+    /// cached, otherwise a command that generates the doc first.
+    async fn doc_comment_action(&self, uri: &Uri, symbol: &Symbol) -> Option<CodeActionOrCommand> {
+        let store = self.store()?;
+        let key = {
+            let docs = self.docs.lock().unwrap();
+            self.target(uri, docs.get(uri)?, symbol.clone(), docs::PROMPT_VERSION)?.key
+        };
+        let cached = store.doc(&key).await.ok().flatten();
+        let action = match cached {
+            Some(doc) => {
+                let (edit, replaces) = self.doc_text_edit(uri, &symbol.qualified_name, &doc)?;
+                CodeAction {
+                    title: format!(
+                        "llm_lsp: {} doc comment",
+                        if replaces { "replace" } else { "insert" }
+                    ),
+                    kind: Some(CodeActionKind::REFACTOR),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(HashMap::from([(uri.clone(), vec![edit])])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+            }
+            None => CodeAction {
+                title: "llm_lsp: generate and insert doc comment".into(),
+                kind: Some(CodeActionKind::REFACTOR),
+                command: Some(Command {
+                    title: "Insert doc".into(),
+                    command: INSERT_DOC_COMMAND.into(),
+                    arguments: Some(vec![json!(uri.as_str()), json!(symbol.qualified_name)]),
+                }),
+                ..Default::default()
+            },
+        };
+        Some(CodeActionOrCommand::CodeAction(action))
+    }
+
+    /// `llm.insertDoc`: generates the doc in the background if needed, then
+    /// asks the editor to insert it where the symbol is *now*.
+    fn insert_doc_later(self: &Arc<Self>, id: SymbolId) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = state.insert_doc(&id).await {
+                state
+                    .client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("llm_lsp: inserting a doc for `{}` failed: {e:#}", id.qualified_name),
+                    )
+                    .await;
+            }
+        });
+    }
+
+    async fn insert_doc(&self, id: &SymbolId) -> anyhow::Result<()> {
+        let store = self.store().context("the database failed to open")?;
+        let uri: Uri = id.uri.parse()?;
+        let target = {
+            let docs = self.docs.lock().unwrap();
+            let doc = docs.get(&uri).context("the file isn't open")?;
+            let (lang, tree) = (
+                doc.lang.context("unsupported language")?,
+                doc.tree().context("no syntax tree")?,
+            );
+            let symbol = symbols::find_reviewable(lang, tree, doc.text(), &id.qualified_name)
+                .context("it no longer exists")?;
+            self.target(&uri, doc, symbol, docs::PROMPT_VERSION)
+                .context("unsupported language")?
+        };
+        let doc = match store.doc(&target.key).await? {
+            Some(doc) => doc,
+            None => {
+                let progress = self.begin_progress(format!("Documenting {}", id.qualified_name)).await;
+                let result = self.run_doc(&target).await;
+                if let Some(p) = progress {
+                    p.finish().await;
+                }
+                result?;
+                store.doc(&target.key).await?.context("the doc wasn't saved")?
+            }
+        };
+        // Positions come from the current text, in case it changed meanwhile.
+        let (edit, _) = self
+            .doc_text_edit(&uri, &id.qualified_name, &doc)
+            .context("there's no place for a doc comment here")?;
+        let response = self
+            .client
+            .apply_edit(WorkspaceEdit {
+                changes: Some(HashMap::from([(uri, vec![edit])])),
+                ..Default::default()
+            })
+            .await?;
+        if !response.applied {
+            let why = response.failure_reason.unwrap_or_else(|| "no reason given".into());
+            anyhow::bail!("the editor didn't apply it: {why}");
+        }
+        Ok(())
+    }
+
     /// Deletes notes about symbols that no longer exist in this (open) file.
     async fn prune_symbol_notes(&self, uri: &Uri, path: &str) -> anyhow::Result<()> {
         let Some(store) = self.store() else {
@@ -1006,7 +1127,13 @@ impl LanguageServer for Backend {
                 completion_provider: Some(CompletionOptions::default()),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: [DISMISS_COMMAND, REVIEW_COMMAND, SHOW_NOTES_COMMAND, CLEAR_NOTES_COMMAND]
+                    commands: [
+                        DISMISS_COMMAND,
+                        REVIEW_COMMAND,
+                        INSERT_DOC_COMMAND,
+                        SHOW_NOTES_COMMAND,
+                        CLEAR_NOTES_COMMAND,
+                    ]
                         .map(String::from)
                         .into(),
                     ..Default::default()
@@ -1172,6 +1299,9 @@ impl LanguageServer for Backend {
                 }),
                 ..Default::default()
             }));
+            if let Some(action) = self.doc_comment_action(&uri, &symbol).await {
+                actions.push(action);
+            }
         }
         Ok((!actions.is_empty()).then_some(actions))
     }
@@ -1187,6 +1317,11 @@ impl LanguageServer for Backend {
                 self.client
                     .show_message(MessageType::ERROR, format!("llm_lsp: {}: {e:#}", params.command))
                     .await;
+            }
+        } else if params.command == INSERT_DOC_COMMAND {
+            match review_target(&params.arguments) {
+                Some(Some(id)) => self.0.insert_doc_later(id),
+                _ => warn!("bad {INSERT_DOC_COMMAND} arguments: {:?}", params.arguments),
             }
         } else if params.command == REVIEW_COMMAND {
             let id = match review_target(&params.arguments) {
