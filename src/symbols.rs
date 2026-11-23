@@ -470,7 +470,7 @@ mod tests {
     /// Every function in the playground files resolves to itself.
     #[test]
     fn playground_files() {
-        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/spikes/helix-log/playground/");
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/playground/");
         let cases: &[(Lang, &str, &str, &str)] = &[
             (Lang::Rust, "src/main.rs", "value / rhs", "Parser::term"),
             (Lang::Rust, "src/main.rs", "Token::LParen => write!", "Token::fmt"),

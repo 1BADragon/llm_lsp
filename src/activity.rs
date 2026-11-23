@@ -4,7 +4,7 @@
 //! Live: the server ticks the tracker once a second and logs each
 //! LeaveEvent to Helix's log (`:log-open`, look for `leave:`).
 //!
-//! What the server can see (spikes/helix-log/FINDINGS.md): edits, plus hover /
+//! What the server can see (DESIGN.md, appendix): edits, plus hover /
 //! completion requests, plus saves. It *cannot* see cursor movement, so
 //! moving away without typing only shows up as silence. That's why the
 //! timeout exists.

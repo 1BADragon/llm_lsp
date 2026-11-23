@@ -152,16 +152,12 @@ Logs go to Helix's log (`:log-open`). Set
 ```sh
 cargo test                       # unit tests
 cargo test -- --include-ignored  # also calls the real claude CLI (fractions of a cent)
-spikes/helix-log/playground/run.sh
+playground/run.sh
 ```
 
 `run.sh` builds the server and opens a small playground (Rust, C, C++ and
 Python files with deliberate bugs) in Helix, with a workspace config that
 uses the debug build. Run `:workspace-trust` in it once.
-
-`spikes/helix-log/` is the logging-only server used to learn what Helix
-sends a second language server; its findings are in
-[FINDINGS.md](spikes/helix-log/FINDINGS.md).
 
 ## License
 

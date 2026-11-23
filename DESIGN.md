@@ -102,7 +102,7 @@ It uses an LLM to:
 LSP doesn't report the cursor position. In Helix, a server listed after the
 primary one (rust-analyzer, clangd, …) never sees cursor movement either:
 single-server features like `documentHighlight` go only to the first capable
-server. See [spike findings](spikes/helix-log/FINDINGS.md). The server infers
+server. See the [appendix](#appendix-what-helix-sends-a-second-language-server). The server infers
 focus from what it does get:
 
 | Signal | Meaning |
@@ -287,7 +287,7 @@ Commands can be bound to keys with `:lsp-workspace-command`, e.g.
 
 ## Open questions
 
-1. ~~What Helix actually sends~~: answered by the spike (edits and explicit
+1. ~~What Helix actually sends~~: answered by measuring it (edits and explicit
    requests only).
 2. ~~How Helix shows hovers from multiple servers~~: all of them, switchable.
 3. ~~`claude -p` cold-start latency~~: ≈1.4s, ≈2.7s for a whole doc. Fine
@@ -296,7 +296,7 @@ Commands can be bound to keys with `:lsp-workspace-command`, e.g.
 
 ## Build order
 
-1. ~~Spike: logging LSP in Helix~~: done, see `spikes/helix-log/FINDINGS.md`.
+1. ~~Spike: logging LSP in Helix~~: done; results in the appendix.
 2. LSP skeleton, document sync, tree-sitter symbol lookup for the 4 core
    languages.
 3. ~~Hover docs + SQLite cache + `claude -p` runner~~: done.
@@ -315,3 +315,63 @@ Commands can be bound to keys with `:lsp-workspace-command`, e.g.
 - 2026-11-22: Run as a second-listed server in Helix and accept that there
   is no cursor tracking. Listing it first would hide clangd's / rust-analyzer's
   document highlights. Focus comes from edits and explicit requests.
+
+## Appendix: what Helix sends a second language server
+
+Measured on Helix 25.07.1 with a logging-only server listed *after*
+clangd / rust-analyzer, over a few editing sessions (open, type, save,
+hover, code actions, switching buffers, moving the cursor). The logging
+server has since been removed. These results shaped
+[Knowing where I'm working](#knowing-where-im-working).
+
+### Setup
+
+- Helix's workspace trust ignores `.helix/` until `:workspace-trust`. Servers
+  that are already running don't pick up the config, so restart `hx` after
+  trusting.
+- Helix runs **one server process per workspace root**, shared by all
+  languages (a C and a Rust file went to the same process).
+
+### Signals a second-listed server receives
+
+| Signal | Received | Notes |
+|---|---|---|
+| `didOpen` | ✅ | Only the first time a buffer opens. |
+| `didChange` | ✅ | Incremental, **one per keystroke**, exact range + text. |
+| `didSave` | ✅ | |
+| `completion` | ✅ | Automatic after a short typing pause, with position. |
+| `hover` | ✅ | Only on `space k`, with position. |
+| `codeAction` | ✅ | Only on `space a`, with the cursor/selection range. Never automatic. |
+| `workspace/executeCommand` | ✅ | Code action → command → our `showMessage` popup worked. |
+| `textDocument/diagnostic` (pull) | ✅ | ~250ms after edits, and in **bursts** (15 in 2.6s while rust-analyzer started). |
+| `documentHighlight` | ⚠️ | Only right at file open, before the primary server is ready. |
+| Cursor movement | ❌ | Nothing. Single-server features (documentHighlight, probably inlayHint and signatureHelp) go to the **first** capable server only. |
+| `inlayHint`, `signatureHelp` | ❌ | Never received (same reason). |
+| `didClose`, buffer switch | ❌ | Switching to an already-open buffer sends nothing. |
+
+When our server is listed second, it sees **edits and explicit requests, not
+cursor movement**. Being listed first would give us `documentHighlight` on
+every cursor move (the primary server gets one about every 40ms during
+movement). But Helix would then show only our (empty) highlights instead of
+clangd's / rust-analyzer's. Not worth it.
+
+### Display
+
+- **Hover**: Helix shows hovers from both servers and lets you switch between
+  them. So hover docs can just use `textDocument/hover`.
+- **Diagnostics**: a pushed Hint from the second server shows up alongside the
+  others.
+
+### Other details
+
+- **Format on save** produces one `didChange` touching many lines (here,
+  clangd re-indenting), ~20ms before `didSave`. It is not user activity and
+  must not count as "worked here".
+- **Client capabilities**:
+  - position encodings utf-8 / utf-32 / utf-16. Use **utf-8**.
+  - `workDoneProgress` (progress spinner)
+  - `workspace/applyEdit`
+  - `showDocument`
+  - hover is markdown only
+  - pull diagnostics with `relatedDocumentSupport`
+  - `publishDiagnostics` with `versionSupport`

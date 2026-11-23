@@ -1,4 +1,4 @@
-/* Throwaway code for the helix-log spike. Edit freely. */
+/* Throwaway code for trying llm_lsp. Edit freely. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
