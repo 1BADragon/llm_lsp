@@ -147,6 +147,14 @@ the first until I pause. Only edited symbols are ever queued.
 
 ## Features
 
+**What's reviewable (and documentable):** functions, methods, plain type
+definitions, and Rust traits. Plain types are Rust struct/enum/union/type
+alias, and C/C++ struct/union/enum without member functions. An anonymous C
+struct is named by its `typedef`. Not yet: classes (C++ `class` or structs
+with member functions, Python `class`), whose methods are covered one by one.
+The plan is to review a class as a "header" with method bodies left out.
+Modules and macros are out.
+
 ### Passive review → diagnostics
 
 - Input: the symbol's text, the file around it (trimmed), project context

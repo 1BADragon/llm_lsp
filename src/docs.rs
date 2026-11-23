@@ -62,7 +62,7 @@ pub fn prompt(req: &DocRequest) -> String {
     out.push_str(&file_section(req.path, req.lang, req.file_text, sym));
     out.push_str(&format!(
         "Document this {lang} {kind}: `{name}` (lines {start}-{end} of the file):\n<symbol>\n{body}\n</symbol>\n",
-        kind = format!("{:?}", sym.kind).to_lowercase(),
+        kind = sym.kind.label(),
         name = sym.qualified_name,
         start = sym.start.row + 1,
         end = sym.end.row + 1,

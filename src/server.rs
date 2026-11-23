@@ -213,7 +213,7 @@ impl State {
         })
     }
 
-    /// The symbol at an LSP position, and a doc target if it's a callable.
+    /// The symbol at an LSP position, and a doc target if it's reviewable.
     fn symbol_at(&self, uri: &Uri, pos: Position) -> Option<(Symbol, Option<Target>)> {
         let docs = self.docs.lock().unwrap();
         let doc = docs.get(uri)?;
@@ -221,7 +221,7 @@ impl State {
         let symbol = symbol_in(doc, offset)?;
         let target = symbol
             .kind
-            .is_callable()
+            .is_reviewable()
             .then(|| self.target(uri, doc, symbol.clone(), docs::PROMPT_VERSION))
             .flatten();
         Some((symbol, target))
@@ -302,9 +302,9 @@ impl State {
             let found = doc
                 .lang
                 .zip(doc.tree())
-                .and_then(|(lang, tree)| symbols::find_callable(lang, tree, doc.text(), &id.qualified_name));
+                .and_then(|(lang, tree)| symbols::find_reviewable(lang, tree, doc.text(), &id.qualified_name));
             let Some(symbol) = found else {
-                return skip("it isn't a function or method in the open file");
+                return skip("it isn't a function, method, type or trait in the open file");
             };
             self.target(&uri, doc, symbol, review::PROMPT_VERSION)
         };
@@ -412,11 +412,11 @@ impl State {
         });
     }
 
-    /// The function or method at a position, if any.
-    fn callable_at(&self, uri: &Uri, pos: Position) -> Option<Symbol> {
+    /// The reviewable symbol at a position, if any.
+    fn reviewable_at(&self, uri: &Uri, pos: Position) -> Option<Symbol> {
         let docs = self.docs.lock().unwrap();
         let doc = docs.get(uri)?;
-        symbol_in(doc, doc.offset_at(pos, self.encoding())).filter(|s| s.kind.is_callable())
+        symbol_in(doc, doc.offset_at(pos, self.encoding())).filter(|s| s.kind.is_reviewable())
     }
 
     /// Findings for `uri` that still apply: not dismissed, and their function
@@ -446,7 +446,7 @@ impl State {
             }
             let symbol = symbols
                 .entry(&p.qualified_name)
-                .or_insert_with(|| symbols::find_callable(lang, tree, doc.text(), &p.qualified_name));
+                .or_insert_with(|| symbols::find_reviewable(lang, tree, doc.text(), &p.qualified_name));
             let Some(symbol) = symbol else {
                 continue;
             };
@@ -493,7 +493,7 @@ impl State {
         self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
     }
 
-    /// The hover for a callable: the cached doc, or a placeholder while one
+    /// The hover for a reviewable symbol: the cached doc, or a placeholder while one
     /// is generated in the background.
     async fn doc_hover(self: &Arc<Self>, target: Target) -> String {
         let name = target.symbol.qualified_name.clone();
@@ -884,8 +884,8 @@ impl LanguageServer for Backend {
         Ok(None)
     }
 
-    /// Generated docs for the function or method under the cursor. Other
-    /// symbols get no hover from us.
+    /// Generated docs for the function, method, type or trait under the
+    /// cursor. Other symbols get no hover from us.
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let p = params.text_document_position_params;
         let found = self.symbol_at(&p.text_document.uri, p.position);
@@ -947,7 +947,7 @@ impl LanguageServer for Backend {
                 ..Default::default()
             }));
         }
-        if let Some(symbol) = self.callable_at(&uri, params.range.start) {
+        if let Some(symbol) = self.reviewable_at(&uri, params.range.start) {
             actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                 title: format!("llm_lsp: review `{}`", symbol.qualified_name),
                 kind: Some(CodeActionKind::SOURCE),
@@ -978,7 +978,7 @@ impl LanguageServer for Backend {
                     self.client
                         .show_message(
                             MessageType::WARNING,
-                            "llm_lsp: no function in focus. Edit or hover one first, or use the code action (space a).",
+                            "llm_lsp: nothing in focus. Edit or hover a function or type first, or use the code action (space a).",
                         )
                         .await
                 }

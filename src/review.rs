@@ -1,5 +1,6 @@
-//! Passive review: what to ask the model about a function I just finished,
-//! and how to turn its answer into findings we trust enough to show.
+//! Passive review: what to ask the model about a function or type I just
+//! finished, and how to turn its answer into findings we trust enough to
+//! show.
 
 use std::ops::Range;
 use std::path::Path;
@@ -14,24 +15,30 @@ use crate::symbols::Symbol;
 
 /// Bump whenever the prompt or schema changes meaningfully, so cached
 /// reviews from the old prompt aren't reused.
-pub const PROMPT_VERSION: i64 = 1;
+pub const PROMPT_VERSION: i64 = 2;
 
 /// More than this many findings on one function is noise.
 const MAX_FINDINGS: usize = 5;
 
 pub const SYSTEM_PROMPT: &str = "\
 You are a senior engineer pair-programming with the author. They just \
-finished editing one function and you glance over it for real problems. \
-They write the code; you only point things out.
+finished editing one function, method, type definition or trait, and you \
+glance over it for real problems. They write the code; you only point \
+things out.
 
 Report only issues that matter:
 - bugs: wrong results, crashes, panics, undefined behavior, off-by-one, \
 unhandled error or edge cases that will happen in practice
 - resource leaks, races, security holes
 - serious performance traps (e.g. accidentally quadratic on real inputs)
+- for type definitions and traits: a field or variant type that can't \
+hold the values it will need to, ownership or lifetime mistakes, a missing \
+`Drop`/`Clone`/`Copy`/derive that callers in the provided code rely on, \
+layout or size problems that matter (e.g. `#[repr]`, padding in C structs \
+shared with other code), and invariants the definition can't uphold
 Do NOT report style, formatting, naming, missing docs or comments, \
-\"consider adding tests\", or speculative concerns. Most functions have \
-nothing worth saying: an empty list is the expected, good answer.
+\"consider adding tests\", or speculative concerns. Most code has nothing \
+worth saying: an empty list is the expected, good answer.
 
 For each finding:
 - severity: \"error\" for something that is very likely a real bug, \
@@ -40,9 +47,9 @@ notable performance trap or hazard.
 - confidence: \"high\" or \"medium\" only if you'd defend it in review; \
 otherwise use \"low\" (low findings are discarded).
 - category: one word, e.g. bug, leak, race, security, performance.
-- anchor: an exact, verbatim substring of the function (copied character \
-for character) marking where the problem is: the smallest expression or \
-single line that shows it, unique within the function.
+- anchor: an exact, verbatim substring of the code under review (copied \
+character for character) marking where the problem is: the smallest \
+expression or single line that shows it, unique within that code.
 - message: one or two plain sentences: what goes wrong and when.
 - fix: optional. Replacement text for exactly the anchor, only when the fix \
 is small, local and certain. Omit it otherwise.
@@ -137,9 +144,9 @@ pub fn prompt(req: &ReviewRequest) -> String {
     let mut out = docs::context_section(req.context);
     out.push_str(&docs::file_section(req.path, req.lang, req.file_text, sym));
     out.push_str(&format!(
-        "Review this {lang} {kind} that was just edited: `{name}` (lines {start}-{end} of the file):\n<function>\n{body}\n</function>\n",
+        "Review this {lang} {kind} that was just edited: `{name}` (lines {start}-{end} of the file):\n<code>\n{body}\n</code>\n",
         lang = req.lang.name(),
-        kind = format!("{:?}", sym.kind).to_lowercase(),
+        kind = sym.kind.label(),
         name = sym.qualified_name,
         start = sym.start.row + 1,
         end = sym.end.row + 1,

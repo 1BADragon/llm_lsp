@@ -34,7 +34,11 @@ pub enum SymbolKind {
     Function,
     /// Function inside an impl / class / trait.
     Method,
-    /// struct / enum / union / class / type alias.
+    /// A plain data type: struct / enum / union / type alias without member
+    /// functions in its body.
+    Type,
+    /// A class with methods in its body: C++ `class` (or a struct with member
+    /// functions), Python `class`. Its methods are symbols of their own.
     Class,
     /// Rust trait.
     Interface,
@@ -43,9 +47,31 @@ pub enum SymbolKind {
 }
 
 impl SymbolKind {
-    /// Functions and methods are what gets reviewed and documented.
     pub fn is_callable(self) -> bool {
         matches!(self, SymbolKind::Function | SymbolKind::Method)
+    }
+
+    /// What gets reviewed and documented: functions, methods, plain types
+    /// and traits. Classes are left out for now (their methods are covered
+    /// one by one), and so are modules and macros.
+    pub fn is_reviewable(self) -> bool {
+        matches!(
+            self,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Type | SymbolKind::Interface
+        )
+    }
+
+    /// How prompts and messages name this kind.
+    pub fn label(self) -> &'static str {
+        match self {
+            SymbolKind::Function => "function",
+            SymbolKind::Method => "method",
+            SymbolKind::Type => "type definition",
+            SymbolKind::Class => "class",
+            SymbolKind::Interface => "trait",
+            SymbolKind::Module => "module",
+            SymbolKind::Macro => "macro",
+        }
     }
 }
 
@@ -92,10 +118,11 @@ pub fn enclosing_symbol(lang: Lang, tree: &Tree, source: &str, byte: usize) -> O
     Some(make_symbol(lang, node, kind, source))
 }
 
-/// Finds the callable whose qualified name is `qualified_name`, wherever it
-/// is now. Used to re-find a symbol after time has passed and the code may
-/// have moved. Returns the first match if names collide (e.g. overloads).
-pub fn find_callable(lang: Lang, tree: &Tree, source: &str, qualified_name: &str) -> Option<Symbol> {
+/// Finds the reviewable symbol whose qualified name is `qualified_name`,
+/// wherever it is now. Used to re-find a symbol after time has passed and
+/// the code may have moved. Returns the first match if names collide (e.g.
+/// overloads, or a C struct tag and a function sharing a name).
+pub fn find_reviewable(lang: Lang, tree: &Tree, source: &str, qualified_name: &str) -> Option<Symbol> {
     // Cheap pre-filter: the bare name must appear in the file.
     let bare = qualified_name.rsplit(separator(lang)).next()?;
     if !source.contains(bare) {
@@ -105,7 +132,7 @@ pub fn find_callable(lang: Lang, tree: &Tree, source: &str, qualified_name: &str
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         if let Some(kind) = symbol_kind(lang, node)
-            && kind.is_callable()
+            && kind.is_reviewable()
             && symbol_name(lang, node, source).ends_with(bare)
         {
             let sym = make_symbol(lang, node, kind, source);
@@ -163,7 +190,7 @@ fn symbol_kind(lang: Lang, node: Node) -> Option<SymbolKind> {
                 Function
             }
         }
-        (Lang::Rust, "struct_item" | "enum_item" | "union_item" | "type_item") => Class,
+        (Lang::Rust, "struct_item" | "enum_item" | "union_item" | "type_item") => Type,
         (Lang::Rust, "trait_item") => Interface,
         (Lang::Rust, "mod_item") => Module,
         (Lang::Rust, "macro_definition") => Macro,
@@ -189,11 +216,15 @@ fn symbol_kind(lang: Lang, node: Node) -> Option<SymbolKind> {
         (Lang::Cpp, "class_specifier") => Class,
 
         // A struct/union/enum only defines something when it has a body:
-        // `struct foo *p;` merely mentions one.
-        (Lang::C | Lang::Cpp, "struct_specifier" | "union_specifier" | "enum_specifier")
-            if node.child_by_field_name("body").is_some() =>
-        {
-            Class
+        // `struct foo *p;` merely mentions one. In C++ a struct with member
+        // functions is really a class.
+        (Lang::C | Lang::Cpp, "struct_specifier" | "union_specifier" | "enum_specifier") => {
+            let body = node.child_by_field_name("body")?;
+            if lang == Lang::Cpp && has_member_functions(body) {
+                Class
+            } else {
+                Type
+            }
         }
 
         (Lang::Python, "function_definition") => {
@@ -234,8 +265,27 @@ fn symbol_name(lang: Lang, node: Node, source: &str) -> String {
     };
     match name_node {
         Some(n) => strip_template_args(text(n, source)),
-        None => "<anonymous>".to_string(),
+        // `typedef struct { … } ring_t;` is known by its typedef name.
+        None => typedef_name(node, source).unwrap_or_else(|| "<anonymous>".to_string()),
     }
+}
+
+fn typedef_name(node: Node, source: &str) -> Option<String> {
+    let parent = node.parent().filter(|p| p.kind() == "type_definition")?;
+    let declarator = parent.child_by_field_name("declarator")?;
+    (declarator.kind() == "type_identifier").then(|| text(declarator, source).to_string())
+}
+
+/// Does a C++ struct/union body define or declare member functions?
+fn has_member_functions(body: Node) -> bool {
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor).any(|member| match member.kind() {
+        "function_definition" | "template_declaration" => true,
+        "field_declaration" | "declaration" => member
+            .child_by_field_name("declarator")
+            .is_some_and(|d| d.kind() == "function_declarator"),
+        _ => false,
+    })
 }
 
 /// C/C++ bury a function's name in nested declarators:
@@ -284,10 +334,12 @@ fn parent_body_of(node: Node, containers: &[&str]) -> bool {
     body.parent().is_some_and(|c| containers.contains(&c.kind()))
 }
 
-/// The definition including wrapper nodes that belong to it.
+/// The definition including wrapper nodes that belong to it: decorators,
+/// `template <…>`, and a `typedef` around a struct.
 fn with_wrapper(node: Node) -> Node {
     match node.parent() {
         Some(p) if matches!(p.kind(), "decorated_definition" | "template_declaration") => p,
+        Some(p) if p.kind() == "type_definition" && p.child_by_field_name("type") == Some(node) => p,
         _ => node,
     }
 }
@@ -349,7 +401,11 @@ mod tests {
         expect(l, "mod m { fn f() { | } }", Function, "m::f");
         expect(l, "fn outer() { let c = || { | }; }", Function, "outer");
         expect(l, "fn outer() { fn inner() { | } }", Function, "outer::inner");
-        expect(l, "struct S { a: |u8 }", Class, "S");
+        expect(l, "struct S { a: |u8 }", Type, "S");
+        expect(l, "enum E { A, |B }", Type, "E");
+        expect(l, "type Id = |u64;", Type, "Id");
+        expect(l, "trait T { fn f(&self)|; }", Method, "T::f");
+        expect(l, "trait T {\n    |\n}", Interface, "T");
         assert_eq!(at_cursor(l, "use std::fmt;|\n"), None);
     }
 
@@ -359,7 +415,11 @@ mod tests {
         let l = Lang::C;
         expect(l, "int ring_push(int *r) {\n    return |0;\n}", Function, "ring_push");
         expect(l, "static void *alloc(size_t n) { | }", Function, "alloc");
-        expect(l, "typedef struct { int |x; } ring_t;", Class, "<anonymous>");
+        expect(l, "typedef struct { int |x; } ring_t;", Type, "ring_t");
+        expect(l, "struct node { struct node *|next; };", Type, "node");
+        expect(l, "enum color { RED, |GREEN };", Type, "color");
+        let anon = at_cursor(l, "struct { int |x; } v;").unwrap();
+        assert_eq!((anon.kind, anon.qualified_name.as_str()), (Type, "<anonymous>"));
         assert_eq!(at_cursor(l, "#include <stdio.h>|\n"), None);
     }
 
@@ -375,6 +435,10 @@ mod tests {
             "Lru::put",
         );
         expect(l, "namespace ns { int f() { | } }", Function, "ns::f");
+        expect(l, "struct Pt { int |x, y; };", Type, "Pt");
+        expect(l, "struct Pt { int |x; int len() const; };", Class, "Pt");
+        expect(l, "struct Pt { int |x; int len() { return x; } };", Class, "Pt");
+        expect(l, "class Lru { int |n; };", Class, "Lru");
         expect(l, "int Lru::size() const { return |0; }", Method, "Lru::size");
         expect(l, "int main() { auto f = [] { | }; }", Function, "main");
         expect(l, "int &pick(int &a) { return |a; }", Function, "pick");
@@ -426,16 +490,18 @@ mod tests {
     }
 
     #[test]
-    fn finds_callables_by_qualified_name() {
+    fn finds_reviewables_by_qualified_name() {
         let source = "struct P;\nimpl P {\n    fn term(&self) {}\n}\nfn term() {}\nmod m { fn term() {} }\n";
         let mut parser = Parser::new();
         parser.set_language(&Lang::Rust.ts_language()).unwrap();
         let tree = parser.parse(source, None).unwrap();
         for (name, line) in [("P::term", 2), ("term", 4), ("m::term", 5)] {
-            let sym = find_callable(Lang::Rust, &tree, source, name).unwrap();
+            let sym = find_reviewable(Lang::Rust, &tree, source, name).unwrap();
             assert_eq!((sym.qualified_name.as_str(), sym.start.row), (name, line));
         }
-        assert_eq!(find_callable(Lang::Rust, &tree, source, "Q::term"), None);
-        assert_eq!(find_callable(Lang::Rust, &tree, source, "missing"), None);
+        assert_eq!(find_reviewable(Lang::Rust, &tree, source, "P").unwrap().kind, SymbolKind::Type);
+        assert_eq!(find_reviewable(Lang::Rust, &tree, source, "Q::term"), None);
+        assert_eq!(find_reviewable(Lang::Rust, &tree, source, "missing"), None);
+        assert_eq!(find_reviewable(Lang::Rust, &tree, source, "m"), None, "modules aren't reviewable");
     }
 }
