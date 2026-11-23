@@ -1,12 +1,8 @@
 //! Activity tracking: where am I working, and when have I *left* a symbol I
 //! edited? A leave event is what triggers a passive review.
 //!
-//! ┌─────────────────────────────────────────────────────────────────────┐
-//! │ STUB: yours to implement. Run the spec with                         │
-//! │     cargo test activity -- --include-ignored                        │
-//! │ Live: the server ticks the tracker once a second and logs each      │
-//! │ LeaveEvent to Helix's log (`:log-open`, look for `leave:`).         │
-//! └─────────────────────────────────────────────────────────────────────┘
+//! Live: the server ticks the tracker once a second and logs each
+//! LeaveEvent to Helix's log (`:log-open`, look for `leave:`).
 //!
 //! What the server can see (spikes/helix-log/FINDINGS.md): edits, plus hover /
 //! completion requests, plus saves. It *cannot* see cursor movement, so
@@ -15,6 +11,7 @@
 //!
 //! All time is passed in (`at`, `now`), so tests never sleep.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Identifies a symbol across edits. The qualified name rather than a body
@@ -43,7 +40,6 @@ pub enum Signal {
     /// A hover or completion request (explicit attention at a position).
     /// `symbol` is `None` outside any symbol.
     Request {
-        uri: String,
         symbol: Option<SymbolId>,
         at: Instant,
     },
@@ -92,29 +88,124 @@ pub struct LeaveEvent {
 ///   anything dirty. A bulk edit with *no* save in the window (multi-cursor
 ///   typing, a paste) is a normal edit. So bulk edits must wait out the window
 ///   before they take effect, and `tick` has to apply them.
+///
+/// Signals can be applied out of order (a held-back bulk edit lands after a
+/// newer keystroke), so focus and attention times only ever move forward.
 pub struct ActivityTracker {
     config: Config,
+    focus: Option<SymbolId>,
+    /// When focus was last set, so an older held-back edit can't override it.
+    focus_at: Option<Instant>,
+    /// Edited symbols not yet left, with when they last had attention.
+    dirty: HashMap<SymbolId, Instant>,
+    /// Bulk edits waiting out `formatter_window`.
+    held: Vec<HeldEdit>,
+}
+
+#[derive(Debug)]
+struct HeldEdit {
+    uri: String,
+    symbols: Vec<SymbolId>,
+    at: Instant,
 }
 
 impl ActivityTracker {
     pub fn new(config: Config) -> Self {
-        ActivityTracker { config }
+        ActivityTracker {
+            config,
+            focus: None,
+            focus_at: None,
+            dirty: HashMap::new(),
+            held: Vec::new(),
+        }
     }
 
     pub fn record(&mut self, signal: Signal) {
-        let _ = (signal, &self.config);
-        // TODO: implement
+        match signal {
+            Signal::Edit {
+                uri,
+                symbols,
+                ranges,
+                lines_touched,
+                at,
+            } => {
+                self.release_held(at);
+                if ranges > 1 || lines_touched > 1 {
+                    self.held.push(HeldEdit { uri, symbols, at });
+                } else {
+                    self.apply_edit(symbols, at);
+                }
+            }
+            Signal::Request { symbol, at, .. } => {
+                self.release_held(at);
+                if let Some(s) = &symbol
+                    && let Some(last) = self.dirty.get_mut(s)
+                {
+                    *last = (*last).max(at);
+                }
+                self.set_focus(symbol, at);
+            }
+            Signal::Save { uri, at } => {
+                // A held bulk edit to this file just before the save was the
+                // formatter: drop it.
+                let window = self.config.formatter_window;
+                self.held
+                    .retain(|h| h.uri != uri || at.saturating_duration_since(h.at) > window);
+                self.release_held(at);
+            }
+        }
     }
 
     /// Advances time to `now` and returns symbols left since the last tick.
     pub fn tick(&mut self, now: Instant) -> Vec<LeaveEvent> {
-        let _ = now;
-        Vec::new() // TODO: implement
+        self.release_held(now);
+        let leave_after = self.config.leave_after;
+        let mut left: Vec<SymbolId> = self
+            .dirty
+            .iter()
+            .filter(|&(_, &last)| now.saturating_duration_since(last) >= leave_after)
+            .map(|(s, _)| s.clone())
+            .collect();
+        left.sort();
+        for s in &left {
+            self.dirty.remove(s);
+        }
+        left.into_iter().map(|symbol| LeaveEvent { symbol }).collect()
     }
 
     /// The symbol I'm currently working in, if known.
     pub fn focus(&self) -> Option<&SymbolId> {
-        None // TODO: implement
+        self.focus.as_ref()
+    }
+
+    /// Applies held bulk edits whose formatter window has passed by `now`:
+    /// no save came, so they were mine.
+    fn release_held(&mut self, now: Instant) {
+        let window = self.config.formatter_window;
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|h| now.saturating_duration_since(h.at) > window);
+        self.held = waiting;
+        for h in ready {
+            self.apply_edit(h.symbols, h.at);
+        }
+    }
+
+    fn apply_edit(&mut self, symbols: Vec<SymbolId>, at: Instant) {
+        // Focus goes to the edit's last symbol (multi-cursor: the last cursor).
+        let focus = symbols.last().cloned();
+        for s in symbols {
+            let last = self.dirty.entry(s).or_insert(at);
+            *last = (*last).max(at);
+        }
+        self.set_focus(focus, at);
+    }
+
+    fn set_focus(&mut self, symbol: Option<SymbolId>, at: Instant) {
+        if self.focus_at.is_none_or(|t| at >= t) {
+            self.focus = symbol;
+            self.focus_at = Some(at);
+        }
     }
 }
 
@@ -170,7 +261,6 @@ mod tests {
         fn hover(&mut self, secs: f64, name: Option<&str>) {
             let at = self.at(secs);
             self.tracker.record(Signal::Request {
-                uri: URI.into(),
                 symbol: name.map(sym),
                 at,
             });
@@ -194,7 +284,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stub: implement activity::ActivityTracker"]
     fn moving_to_another_symbol_leaves_after_the_timeout() {
         let mut t = T::new();
         t.edit(0.0, &["a"]);
@@ -207,7 +296,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stub: implement activity::ActivityTracker"]
     fn going_quiet_leaves_too() {
         let mut t = T::new();
         t.edit(0.0, &["a"]);
@@ -216,7 +304,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stub: implement activity::ActivityTracker"]
     fn more_edits_or_a_hover_in_the_symbol_reset_the_clock() {
         let mut t = T::new();
         t.edit(0.0, &["a"]);
@@ -228,7 +315,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stub: implement activity::ActivityTracker"]
     fn coming_back_before_the_timeout_cancels_the_leave() {
         let mut t = T::new();
         t.edit(0.0, &["a"]);
@@ -240,7 +326,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stub: implement activity::ActivityTracker"]
     fn hovering_never_makes_a_symbol_dirty() {
         let mut t = T::new();
         t.hover(0.0, Some("a"));
@@ -249,7 +334,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stub: implement activity::ActivityTracker"]
     fn editing_outside_any_symbol_clears_focus() {
         let mut t = T::new();
         t.edit(0.0, &["a"]);
@@ -259,7 +343,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stub: implement activity::ActivityTracker"]
     fn editing_again_after_a_leave_makes_it_dirty_again() {
         let mut t = T::new();
         t.edit(0.0, &["a"]);
@@ -269,7 +352,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stub: implement activity::ActivityTracker"]
     fn format_on_save_is_not_me() {
         let mut t = T::new();
         t.edit(0.0, &["a"]);
@@ -282,7 +364,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stub: implement activity::ActivityTracker"]
     fn bulk_edit_without_a_save_is_me() {
         // Multi-cursor typing across two functions.
         let mut t = T::new();
@@ -290,5 +371,32 @@ mod tests {
         assert!(t.tick(0.5).is_empty());
         assert_eq!(t.tracker.focus(), Some(&sym("b")), "last symbol in the edit");
         assert_eq!(t.tick(10.5), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_held_bulk_edit_does_not_steal_focus_from_newer_typing() {
+        let mut t = T::new();
+        t.bulk_edit(0.0, &["a", "b"]);
+        t.edit(0.05, &["c"]);
+        assert!(t.tick(0.5).is_empty());
+        assert_eq!(t.tracker.focus(), Some(&sym("c")));
+        assert_eq!(t.tick(10.5), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn pressing_enter_is_a_normal_edit() {
+        // A newline touches two lines, so it's held for the formatter
+        // window, then counts.
+        let mut t = T::new();
+        t.tracker.record(Signal::Edit {
+            uri: URI.into(),
+            symbols: vec![sym("a")],
+            ranges: 1,
+            lines_touched: 2,
+            at: t.at(0.0),
+        });
+        assert!(t.tick(0.5).is_empty());
+        assert_eq!(t.tracker.focus(), Some(&sym("a")));
+        assert_eq!(t.tick(10.5), ["a"]);
     }
 }

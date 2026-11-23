@@ -131,8 +131,9 @@ impl State {
     }
 
     fn record(&self, signal: Signal) {
-        debug!(?signal, "activity");
-        self.tracker.lock().unwrap().record(signal);
+        let mut tracker = self.tracker.lock().unwrap();
+        tracker.record(signal);
+        debug!(focus = ?tracker.focus().map(|f| &f.qualified_name), "activity");
     }
 
     /// The symbol at an LSP position, and whether it's documentable.
@@ -163,7 +164,6 @@ impl State {
 
     fn request_signal(&self, uri: &Uri, symbol: Option<&Symbol>) {
         self.record(Signal::Request {
-            uri: uri.to_string(),
             symbol: symbol.map(|s| symbol_id(uri, s)),
             at: Instant::now(),
         });

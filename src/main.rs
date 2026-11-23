@@ -1,9 +1,5 @@
 //! llm_lsp: an LLM-backed pair-programmer language server. See DESIGN.md.
 
-// The `activity` stub leaves some of the plumbing unused.
-// Remove once they're implemented.
-#![allow(dead_code)]
-
 mod activity;
 mod claude;
 mod docs;

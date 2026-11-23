@@ -6,7 +6,6 @@
 //! migrations in `migrations/` are embedded at compile time.
 
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -60,8 +59,9 @@ impl Store {
         Self::connect(SqlitePoolOptions::new().max_connections(4), options).await
     }
 
+    #[cfg(test)]
     pub async fn open_in_memory() -> Result<Self> {
-        let options = SqliteConnectOptions::from_str("sqlite::memory:")?;
+        let options = <SqliteConnectOptions as std::str::FromStr>::from_str("sqlite::memory:")?;
         // Each in-memory connection is its own database: keep exactly one.
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
