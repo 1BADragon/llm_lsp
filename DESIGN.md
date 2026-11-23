@@ -129,8 +129,15 @@ recently-touched symbols. The main trigger is:
 > for *N* seconds (default ~10s, the only option when I move without typing).
 > It is then queued for review.
 
-Not yet built: `didSave` queuing all dirty symbols in that file, and explicit
-commands (`llm.reviewSymbol`, `llm.reviewFile`) that bypass the debounce.
+**Explicit review**: `llm.reviewSymbol` runs immediately, skipping the idle
+wait and the hourly budget (the cache still applies), and always reports
+the outcome in a message. With no arguments
+(`:lsp-workspace-command llm.reviewSymbol`, bindable to a key) it reviews the
+tracker's focus. The code action "llm_lsp: review `name`" passes the
+function under the cursor.
+
+Not yet built: `didSave` queuing all dirty symbols in that file, and
+`llm.reviewFile`.
 
 **Idle gating.** Leave events only *queue* reviews. A review starts once
 there has been no activity at all for `review-idle-secs` (default 10s). Reviews

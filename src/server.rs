@@ -31,6 +31,9 @@ const DOC_CONCURRENCY: usize = 2;
 const DOC_TIMEOUT: Duration = Duration::from_secs(120);
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(300);
 const DISMISS_COMMAND: &str = "llm.dismiss";
+/// Review a function now. Arguments: `[uri, qualified_name]`, or none for
+/// the function in focus (what `:lsp-workspace-command` sends).
+const REVIEW_COMMAND: &str = "llm.reviewSymbol";
 const SOURCE: &str = "llm_lsp";
 
 /// Settings from the editor's `initializationOptions`. In Helix:
@@ -86,6 +89,12 @@ struct Published {
     qualified_name: String,
     body_hash: String,
     finding: Finding,
+}
+
+enum ReviewOutcome {
+    /// `shown` excludes dismissed findings; `total` includes them.
+    Reviewed { name: String, shown: usize, total: usize, cached: bool },
+    Skipped(String),
 }
 
 /// A finding that still applies to the current text, ready to show.
@@ -263,8 +272,10 @@ impl State {
                 Some(id) => {
                     let state = Arc::clone(self);
                     tokio::spawn(async move {
-                        if let Err(e) = state.review(&id).await {
-                            warn!("reviewing {}: {e:#}", id.qualified_name);
+                        match state.review(&id, false).await {
+                            Ok(ReviewOutcome::Skipped(why)) => debug!("{why}"),
+                            Ok(ReviewOutcome::Reviewed { .. }) => {}
+                            Err(e) => warn!("reviewing {}: {e:#}", id.qualified_name),
                         }
                         state.reviewing.store(false, Ordering::Release);
                     });
@@ -275,35 +286,37 @@ impl State {
     }
 
     /// Reviews one symbol (from cache when its text was reviewed before) and
-    /// publishes the findings.
-    async fn review(&self, id: &SymbolId) -> anyhow::Result<()> {
+    /// publishes the findings. `explicit` reviews were asked for, so they
+    /// ignore the hourly budget.
+    async fn review(&self, id: &SymbolId, explicit: bool) -> anyhow::Result<ReviewOutcome> {
+        let skip = |why: &str| Ok(ReviewOutcome::Skipped(format!("not reviewing `{}`: {why}", id.qualified_name)));
         let Some(store) = self.store() else {
-            return Ok(());
+            return skip("the database failed to open");
         };
         let uri: Uri = id.uri.parse()?;
         let target = {
             let docs = self.docs.lock().unwrap();
             let Some(doc) = docs.get(&uri) else {
-                debug!("not reviewing {}: document closed", id.qualified_name);
-                return Ok(());
+                return skip("its file isn't open");
             };
             let found = doc
                 .lang
                 .zip(doc.tree())
                 .and_then(|(lang, tree)| symbols::find_callable(lang, tree, doc.text(), &id.qualified_name));
             let Some(symbol) = found else {
-                debug!("not reviewing {}: no longer exists", id.qualified_name);
-                return Ok(());
+                return skip("it isn't a function or method in the open file");
             };
             self.target(&uri, doc, symbol, review::PROMPT_VERSION)
         };
         let Some(target) = target else {
-            return Ok(());
+            return skip("unsupported language");
         };
         let name = &target.symbol.qualified_name;
         let config = self.config();
 
-        let findings: Vec<Finding> = match store.review(&target.key).await? {
+        let cached = store.review(&target.key).await?;
+        let from_cache = cached.is_some();
+        let findings: Vec<Finding> = match cached {
             Some(json) => {
                 debug!("review of {name} is cached");
                 serde_json::from_str(&json)?
@@ -311,13 +324,13 @@ impl State {
             None => {
                 let hour_ago = SystemTime::now() - Duration::from_secs(3600);
                 let used = store.runs_since("review", hour_ago).await?;
-                if used >= config.max_reviews_per_hour {
+                if !explicit && used >= config.max_reviews_per_hour {
                     let msg = format!(
                         "review budget reached ({used} in the last hour); not reviewing {name}"
                     );
                     warn!("{msg}");
-                    self.client.log_message(MessageType::WARNING, msg).await;
-                    return Ok(());
+                    self.client.log_message(MessageType::WARNING, &msg).await;
+                    return Ok(ReviewOutcome::Skipped(msg));
                 }
 
                 let context = read_context_files(&self.root());
@@ -353,6 +366,7 @@ impl State {
             }
         };
         info!(name = %name, findings = findings.len(), "reviewed");
+        let total = findings.len();
 
         {
             let mut all = self.findings.lock().unwrap();
@@ -365,7 +379,44 @@ impl State {
             }));
         }
         self.publish(&uri).await;
-        Ok(())
+        let shown = self
+            .live_findings(&uri)
+            .iter()
+            .filter(|l| &l.qualified_name == name)
+            .count();
+        Ok(ReviewOutcome::Reviewed {
+            name: name.clone(),
+            shown,
+            total,
+            cached: from_cache,
+        })
+    }
+
+    /// Runs an explicit review in the background and reports the result in
+    /// a message, even when there's nothing to show.
+    fn review_now(self: &Arc<Self>, id: SymbolId) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            state.review_queue.lock().unwrap().retain(|q| q != &id);
+            let (typ, msg) = match state.review(&id, true).await {
+                Ok(ReviewOutcome::Reviewed { name, shown, total, cached }) => {
+                    (MessageType::INFO, review_summary(&name, shown, total, cached))
+                }
+                Ok(ReviewOutcome::Skipped(why)) => (MessageType::WARNING, format!("llm_lsp: {why}")),
+                Err(e) => (
+                    MessageType::ERROR,
+                    format!("llm_lsp: reviewing `{}` failed: {e:#}", id.qualified_name),
+                ),
+            };
+            state.client.show_message(typ, msg).await;
+        });
+    }
+
+    /// The function or method at a position, if any.
+    fn callable_at(&self, uri: &Uri, pos: Position) -> Option<Symbol> {
+        let docs = self.docs.lock().unwrap();
+        let doc = docs.get(uri)?;
+        symbol_in(doc, doc.offset_at(pos, self.encoding())).filter(|s| s.kind.is_callable())
     }
 
     /// Findings for `uri` that still apply: not dismissed, and their function
@@ -632,6 +683,40 @@ fn project_root(params: &InitializeParams) -> Option<PathBuf> {
     uri.to_file_path().map(|p| p.into_owned())
 }
 
+fn review_summary(name: &str, shown: usize, total: usize, cached: bool) -> String {
+    let what = match shown {
+        0 => "no findings".to_string(),
+        1 => "1 finding".to_string(),
+        n => format!("{n} findings"),
+    };
+    let mut notes = Vec::new();
+    if total > shown {
+        notes.push(format!("{} dismissed", total - shown));
+    }
+    if cached {
+        notes.push("unchanged since last review".to_string());
+    }
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", notes.join(", "))
+    };
+    format!("llm_lsp: {what} in `{name}`{notes}")
+}
+
+/// `llm.reviewSymbol` arguments: `Some(None)` for none (use focus),
+/// `Some(Some(id))` for `[uri, qualified_name]`, `None` if malformed.
+fn review_target(args: &[LSPAny]) -> Option<Option<SymbolId>> {
+    match args {
+        [] => Some(None),
+        [uri, name] => Some(Some(SymbolId {
+            uri: uri.as_str()?.to_string(),
+            qualified_name: name.as_str()?.to_string(),
+        })),
+        _ => None,
+    }
+}
+
 fn lines_overlap(a: Range, b: Range) -> bool {
     a.start.line <= b.end.line && b.start.line <= a.end.line
 }
@@ -709,7 +794,7 @@ impl LanguageServer for Backend {
                 completion_provider: Some(CompletionOptions::default()),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec![DISMISS_COMMAND.into()],
+                    commands: vec![DISMISS_COMMAND.into(), REVIEW_COMMAND.into()],
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -862,11 +947,43 @@ impl LanguageServer for Backend {
                 ..Default::default()
             }));
         }
+        if let Some(symbol) = self.callable_at(&uri, params.range.start) {
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("llm_lsp: review `{}`", symbol.qualified_name),
+                kind: Some(CodeActionKind::SOURCE),
+                command: Some(Command {
+                    title: "Review".into(),
+                    command: REVIEW_COMMAND.into(),
+                    arguments: Some(vec![json!(uri.as_str()), json!(symbol.qualified_name)]),
+                }),
+                ..Default::default()
+            }));
+        }
         Ok((!actions.is_empty()).then_some(actions))
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<LSPAny>> {
-        if params.command == DISMISS_COMMAND {
+        if params.command == REVIEW_COMMAND {
+            let id = match review_target(&params.arguments) {
+                Some(Some(id)) => Some(id),
+                Some(None) => self.tracker.lock().unwrap().focus().cloned(),
+                None => {
+                    warn!("bad {REVIEW_COMMAND} arguments: {:?}", params.arguments);
+                    None
+                }
+            };
+            match id {
+                Some(id) => self.0.review_now(id),
+                None => {
+                    self.client
+                        .show_message(
+                            MessageType::WARNING,
+                            "llm_lsp: no function in focus. Edit or hover one first, or use the code action (space a).",
+                        )
+                        .await
+                }
+            }
+        } else if params.command == DISMISS_COMMAND {
             let args: Vec<String> = params
                 .arguments
                 .iter()
@@ -895,6 +1012,27 @@ mod tests {
         assert_eq!(short("Uses `x.y`. Then"), "Uses `x.y`");
         let long = "a".repeat(80);
         assert_eq!(short(&long).chars().count(), 60);
+    }
+
+    #[test]
+    fn review_summaries() {
+        assert_eq!(review_summary("f", 0, 0, false), "llm_lsp: no findings in `f`");
+        assert_eq!(review_summary("f", 2, 2, false), "llm_lsp: 2 findings in `f`");
+        assert_eq!(
+            review_summary("f", 0, 1, true),
+            "llm_lsp: no findings in `f` (1 dismissed, unchanged since last review)"
+        );
+    }
+
+    #[test]
+    fn review_command_arguments() {
+        assert_eq!(review_target(&[]), Some(None));
+        assert_eq!(
+            review_target(&[json!("file:///a.rs"), json!("P::f")]),
+            Some(Some(SymbolId { uri: "file:///a.rs".into(), qualified_name: "P::f".into() }))
+        );
+        assert_eq!(review_target(&[json!("file:///a.rs")]), None);
+        assert_eq!(review_target(&[json!(1), json!("f")]), None);
     }
 
     #[test]
