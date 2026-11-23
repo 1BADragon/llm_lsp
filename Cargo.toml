@@ -2,6 +2,10 @@
 name = "llm_lsp"
 version = "0.1.0"
 edition = "2024"
+description = "LLM-backed pair-programmer language server: passive code review and on-demand hover docs via the Claude Code CLI"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/1BADragon/llm_lsp"
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"
