@@ -1,0 +1,23 @@
+# Workspace-local Helix config: only applies when hx is run from this folder.
+# `language-servers` replaces the list for each language, so the usual servers
+# are kept in it.
+
+[language-server.helix-log]
+command = "/home/matt/Workspace/llm_lsp/spikes/helix-log/target/release/helix-log"
+environment = { LLM_LSP_SPIKE_DIR = "/home/matt/Workspace/llm_lsp/spikes/helix-log/playground/logs" }
+
+[[language]]
+name = "rust"
+language-servers = ["rust-analyzer", "helix-log"]
+
+[[language]]
+name = "python"
+language-servers = ["pyright", "ruff", "helix-log"]
+
+[[language]]
+name = "c"
+language-servers = ["clangd", "helix-log"]
+
+[[language]]
+name = "cpp"
+language-servers = ["clangd", "helix-log"]
